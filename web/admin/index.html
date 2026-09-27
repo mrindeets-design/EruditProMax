@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Erudit Admin</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #F5F7FA;
+            padding: 40px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            padding: 32px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+        h1 { color: #003B7A; }
+        .status {
+            margin-top: 20px;
+            padding: 16px;
+            border-radius: 8px;
+            background: #F5F7FA;
+            border-left: 4px solid #003B7A;
+            font-size: 14px;
+            color: #5F6368;
+        }
+        .status.ok { border-left-color: #2e7d32; }
+        .status.error { border-left-color: #c62828; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Админка Эрудит</h1>
+    <p style="color:#5F6368;">Панель управления ассистентом колледжа НОМОС.</p>
+    <div id="health" class="status">Проверка сервера...</div>
+</div>
+
+<script>
+    fetch('/api/health')
+        .then((r) => r.text())
+        .then((text) => {
+            const el = document.getElementById('health');
+            el.textContent = 'Сервер работает: ' + text;
+            el.classList.add('ok');
+        })
+        .catch(() => {
+            const el = document.getElementById('health');
+            el.textContent = 'Сервер недоступен';
+            el.classList.add('error');
+        });
+</script>
+</body>
+</html>

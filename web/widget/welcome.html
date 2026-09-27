@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Эрудит — приветствие</title>
+
+    <link
+            rel="stylesheet"
+            href="/widget/welcome.css"
+    >
+
+</head>
+
+
+<body>
+
+
+<main class="welcome-window">
+
+
+    <!-- =====================================================
+         HEADER
+         ===================================================== -->
+
+    <header class="header">
+
+
+        <div class="avatar-wrap">
+
+            <img
+                    class="avatar"
+                    src="/widget/assets/erudit.png"
+                    alt="Эрудит"
+            >
+
+            <span class="online-dot"></span>
+
+        </div>
+
+
+        <div>
+
+            <div class="header-title">
+                Добро пожаловать!
+            </div>
+
+
+            <div class="header-subtitle">
+                Я Эрудит — виртуальный помощник колледжа НОМОС.
+            </div>
+
+        </div>
+
+
+    </header>
+
+
+
+    <!-- =====================================================
+         CONTENT
+         ===================================================== -->
+
+    <section class="content">
+
+
+        <h1 class="greeting-title">
+
+            Здравствуйте!
+            Я
+            <span>Эрудит</span>
+
+        </h1>
+
+
+
+        <p class="description">
+
+            Я могу помочь вам найти информацию
+            о поступлении, стоимости обучения,
+            расписании, образовательных программах,
+            документах и других вопросах.
+
+            Задайте свой вопрос ниже —
+            после отправки мы продолжим
+            общение в полноценном диалоге.
+
+        </p>
+
+
+
+        <!-- =================================================
+             ФОРМА
+             ================================================= -->
+
+        <form id="questionForm">
+
+
+            <label
+                    class="question-label"
+                    for="questionInput"
+            >
+                Что вас интересует?
+            </label>
+
+
+
+            <div class="question-box">
+
+
+                <input
+                        id="questionInput"
+                        class="question-input"
+                        type="text"
+                        autocomplete="off"
+                        placeholder="Например: сколько стоит обучение?"
+                >
+
+
+
+                <button
+                        class="send-button"
+                        type="submit"
+                        aria-label="Отправить вопрос"
+                >
+
+                    <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                    >
+
+                        <path d="M22 2L11 13"></path>
+
+                        <path d="M22 2l-7 20-9-4z"></path>
+
+                    </svg>
+
+                </button>
+
+
+            </div>
+
+
+        </form>
+
+
+
+        <div class="hint">
+
+            После отправки откроется диалог
+            с Эрудитом.
+
+        </div>
+
+
+    </section>
+
+
+</main>
+
+
+
+<script src="/widget/welcome.js"></script>
+
+
+</body>
+
+</html>

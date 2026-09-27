@@ -1,0 +1,49 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+erudit.log
+
+# Cache
+cache.db
+*.db
+*.db-shm
+*.db-wal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.swp
+*~
+
+# Build output
+build/
+dist/
+
+# Test output files
+*.txt
+bogitova_priority_output.txt
+teacher_chunking_output.txt

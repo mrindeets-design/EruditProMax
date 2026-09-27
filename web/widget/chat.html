@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Эрудит — чат</title>
+
+    <link
+            rel="stylesheet"
+            href="/widget/chat.css?v=2"
+    >
+
+</head>
+
+<body>
+
+<main class="chat-window">
+
+    <header class="chat-header">
+
+        <div class="avatar-wrap">
+
+            <img
+                    src="/widget/assets/erudit.png"
+                    alt="Эрудит"
+            >
+
+            <span class="online-dot"></span>
+
+        </div>
+
+        <div>
+
+            <div class="title">
+                Эрудит
+            </div>
+
+            <div class="subtitle">
+                ИИ-помощник колледжа НОМОС
+            </div>
+
+        </div>
+
+    </header>
+
+
+    <section
+            id="messages"
+            class="messages"
+    ></section>
+
+
+    <form
+            id="chatForm"
+            class="composer"
+    >
+
+        <input
+                id="chatInput"
+                type="text"
+                autocomplete="off"
+                placeholder="Напишите вопрос..."
+        >
+
+        <button type="submit">
+            Отправить
+        </button>
+
+    </form>
+
+</main>
+
+
+<!-- ВАЖНО: новая версия файла -->
+<script src="/widget/chat.js?v=2"></script>
+
+</body>
+
+</html>

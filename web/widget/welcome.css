@@ -1,0 +1,481 @@
+* {
+    box-sizing: border-box;
+}
+
+
+html,
+body {
+
+    margin: 0;
+
+    padding: 0;
+
+    min-height: 100%;
+
+}
+
+
+body {
+
+    min-height: 100vh;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    padding: 24px;
+
+    background:
+            radial-gradient(
+                    circle at top,
+                    rgba(10, 87, 170, 0.10),
+                    transparent 45%
+            ),
+            #f4f8fc;
+
+    font-family:
+            -apple-system,
+            BlinkMacSystemFont,
+            "Segoe UI",
+            Roboto,
+            Arial,
+            sans-serif;
+
+}
+
+
+/* =========================================================
+   ОКНО
+   ========================================================= */
+
+.welcome-window {
+
+    width: min(700px, 100%);
+
+    overflow: hidden;
+
+    background: #ffffff;
+
+    border:
+            1px solid #e4ebf3;
+
+    border-radius: 30px;
+
+    box-shadow:
+            0 30px 90px
+            rgba(0, 35, 80, 0.18);
+
+}
+
+
+/* =========================================================
+   HEADER
+   ========================================================= */
+
+.header {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 20px;
+
+    padding: 32px 36px;
+
+    color: #ffffff;
+
+    background:
+            linear-gradient(
+                    135deg,
+                    #06468e 0%,
+                    #03316c 100%
+            );
+
+}
+
+
+/* =========================================================
+   АВАТАР
+   ========================================================= */
+
+.avatar-wrap {
+
+    position: relative;
+
+    width: 82px;
+
+    height: 82px;
+
+    flex-shrink: 0;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    border:
+            2px solid
+            rgba(255, 255, 255, 0.25);
+
+    border-radius: 50%;
+
+    background:
+            rgba(255, 255, 255, 0.12);
+
+}
+
+
+.avatar {
+
+    width: 76px;
+
+    height: 76px;
+
+    object-fit: contain;
+
+    border-radius: 50%;
+
+}
+
+
+/* =========================================================
+   ONLINE
+   ========================================================= */
+
+.online-dot {
+
+    position: absolute;
+
+    right: 1px;
+
+    bottom: 1px;
+
+    width: 19px;
+
+    height: 19px;
+
+    border:
+            3px solid
+            #06468e;
+
+    border-radius: 50%;
+
+    background:
+            #22c55e;
+
+}
+
+
+/* =========================================================
+   ЗАГОЛОВОК
+   ========================================================= */
+
+.header-title {
+
+    font-size: 28px;
+
+    font-weight: 700;
+
+    line-height: 1.1;
+
+}
+
+
+.header-subtitle {
+
+    max-width: 480px;
+
+    margin-top: 8px;
+
+    color:
+            rgba(255, 255, 255, 0.84);
+
+    font-size: 13px;
+
+    line-height: 1.5;
+
+}
+
+
+/* =========================================================
+   CONTENT
+   ========================================================= */
+
+.content {
+
+    padding: 40px;
+
+}
+
+
+.greeting-title {
+
+    margin: 0;
+
+    color: #14324e;
+
+    font-size: 33px;
+
+    line-height: 1.15;
+
+}
+
+
+.greeting-title span {
+
+    color: #064991;
+
+}
+
+
+.description {
+
+    max-width: 600px;
+
+    margin: 14px 0 0;
+
+    color: #74869a;
+
+    font-size: 14px;
+
+    line-height: 1.65;
+
+}
+
+
+/* =========================================================
+   ВОПРОС
+   ========================================================= */
+
+.question-label {
+
+    display: block;
+
+    margin:
+            31px 0 9px;
+
+    color: #455a71;
+
+    font-size: 12px;
+
+    font-weight: 600;
+
+}
+
+
+.question-box {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 8px;
+
+    padding:
+            6px
+            6px
+            6px
+            15px;
+
+    border:
+            1px solid
+            #dbe4ed;
+
+    border-radius: 20px;
+
+    background: #fbfcfe;
+
+}
+
+
+.question-box:focus-within {
+
+    border-color: #9db9d8;
+
+    box-shadow:
+            0 0 0 4px
+            rgba(6, 63, 131, 0.06);
+
+}
+
+
+.question-input {
+
+    flex: 1;
+
+    min-width: 0;
+
+    height: 48px;
+
+    padding: 0;
+
+    border: none;
+
+    outline: none;
+
+    background: transparent;
+
+    color: #20364d;
+
+    font-size: 14px;
+
+}
+
+
+.question-input::placeholder {
+
+    color: #9daab8;
+
+}
+
+
+/* =========================================================
+   КНОПКА
+   ========================================================= */
+
+.send-button {
+
+    width: 48px;
+
+    height: 48px;
+
+    flex-shrink: 0;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    border: none;
+
+    border-radius: 50%;
+
+    background: #06468e;
+
+    color: #ffffff;
+
+    cursor: pointer;
+
+    transition:
+            background 0.2s ease,
+            transform 0.2s ease;
+
+}
+
+
+.send-button:hover {
+
+    background: #03366f;
+
+    transform: scale(1.04);
+
+}
+
+
+.send-button svg {
+
+    width: 20px;
+
+    height: 20px;
+
+}
+
+
+/* =========================================================
+   ПОДСКАЗКА
+   ========================================================= */
+
+.hint {
+
+    margin-top: 10px;
+
+    color: #97a4b2;
+
+    font-size: 11px;
+
+}
+
+
+/* =========================================================
+   MOBILE
+   ========================================================= */
+
+@media (max-width: 600px) {
+
+
+    body {
+
+        padding: 12px;
+
+    }
+
+
+    .header {
+
+        gap: 14px;
+
+        padding: 24px;
+
+    }
+
+
+    .avatar-wrap {
+
+        width: 66px;
+
+        height: 66px;
+
+    }
+
+
+    .avatar {
+
+        width: 60px;
+
+        height: 60px;
+
+    }
+
+
+    .header-title {
+
+        font-size: 21px;
+
+    }
+
+
+    .header-subtitle {
+
+        font-size: 11px;
+
+    }
+
+
+    .content {
+
+        padding:
+                27px
+                21px
+                30px;
+
+    }
+
+
+    .greeting-title {
+
+        font-size: 26px;
+
+    }
+
+
+    .description {
+
+        font-size: 13px;
+
+    }
+
+}

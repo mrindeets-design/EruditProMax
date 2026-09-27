@@ -1,0 +1,601 @@
+* {
+    box-sizing: border-box;
+}
+
+
+/* =========================================================
+   ОСНОВНАЯ СТРАНИЦА
+   ========================================================= */
+
+html,
+body {
+
+    margin: 0;
+
+    padding: 0;
+
+    width: 100%;
+
+    min-height: 100%;
+
+}
+
+
+body {
+
+    min-height: 100vh;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    padding: 24px;
+
+    background:
+            radial-gradient(
+                    circle at top,
+                    rgba(10, 87, 170, 0.10),
+                    transparent 45%
+            ),
+            #f4f8fc;
+
+    font-family:
+            -apple-system,
+            BlinkMacSystemFont,
+            "Segoe UI",
+            Roboto,
+            Arial,
+            sans-serif;
+
+}
+
+
+/* =========================================================
+   ОКНО ЧАТА
+   ========================================================= */
+
+.chat-window {
+
+    width:
+            min(860px, 100%);
+
+    height:
+            min(760px, 92vh);
+
+    display: flex;
+
+    flex-direction: column;
+
+    overflow: hidden;
+
+    background: #ffffff;
+
+    border:
+            1px solid
+            #dfe8f0;
+
+    border-radius: 26px;
+
+    box-shadow:
+            0 30px 90px
+            rgba(0, 35, 80, 0.16);
+
+}
+
+
+/* =========================================================
+   ШАПКА
+   ========================================================= */
+
+.chat-header {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 15px;
+
+    padding: 20px 24px;
+
+    color: #ffffff;
+
+    background:
+            linear-gradient(
+                    135deg,
+                    #06468e,
+                    #03316c
+            );
+
+}
+
+
+/* =========================================================
+   АВАТАР
+   ========================================================= */
+
+.avatar-wrap {
+
+    position: relative;
+
+    width: 58px;
+
+    height: 58px;
+
+    flex-shrink: 0;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    border-radius: 50%;
+
+    background:
+            rgba(
+                    255,
+                    255,
+                    255,
+                    0.12
+            );
+
+}
+
+
+.avatar-wrap img {
+
+    width: 54px;
+
+    height: 54px;
+
+    display: block;
+
+    object-fit: contain;
+
+    border-radius: 50%;
+
+}
+
+
+/* =========================================================
+   ЗЕЛЁНАЯ ТОЧКА
+   ========================================================= */
+
+.online-dot {
+
+    position: absolute;
+
+    right: 0;
+
+    bottom: 0;
+
+    width: 15px;
+
+    height: 15px;
+
+    border:
+            2px solid
+            #06468e;
+
+    border-radius: 50%;
+
+    background: #22c55e;
+
+}
+
+
+/* =========================================================
+   НАЗВАНИЕ
+   ========================================================= */
+
+.title {
+
+    font-size: 21px;
+
+    font-weight: 700;
+
+    line-height: 1.2;
+
+}
+
+
+.subtitle {
+
+    margin-top: 4px;
+
+    color:
+            rgba(
+                    255,
+                    255,
+                    255,
+                    0.82
+            );
+
+    font-size: 12px;
+
+    line-height: 1.4;
+
+}
+
+
+/* =========================================================
+   ОБЛАСТЬ СООБЩЕНИЙ
+   ========================================================= */
+
+.messages {
+
+    flex: 1;
+
+    min-height: 0;
+
+    overflow-y: auto;
+
+    padding: 24px;
+
+    background: #f8fbfe;
+
+}
+
+
+/* =========================================================
+   ОБЩЕЕ СООБЩЕНИЕ
+   ========================================================= */
+
+.message {
+
+    max-width: 78%;
+
+    margin-bottom: 14px;
+
+    padding:
+            12px
+            15px;
+
+    border-radius: 16px;
+
+    font-size: 14px;
+
+    line-height: 1.5;
+
+    white-space: pre-wrap;
+
+    overflow-wrap: anywhere;
+
+}
+
+
+/* =========================================================
+   СООБЩЕНИЕ ЭРУДИТА
+   ========================================================= */
+
+.message.bot {
+
+    margin-right: auto;
+
+    background: #eaf2fb;
+
+    color: #193754;
+
+    border-top-left-radius: 5px;
+
+}
+
+
+/* =========================================================
+   СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ
+   ========================================================= */
+
+.message.user {
+
+    margin-left: auto;
+
+    background: #06468e;
+
+    color: #ffffff;
+
+    border-top-right-radius: 5px;
+
+}
+
+
+/* =========================================================
+   ВВОД
+   ========================================================= */
+
+.composer {
+
+    display: flex;
+
+    align-items: center;
+
+    gap: 10px;
+
+    padding: 14px;
+
+    border-top:
+            1px solid
+            #e1e8ef;
+
+    background: #ffffff;
+
+}
+
+
+/* =========================================================
+   INPUT
+   ========================================================= */
+
+.composer input {
+
+    flex: 1;
+
+    min-width: 0;
+
+    height: 48px;
+
+    padding:
+            0
+            15px;
+
+    border:
+            1px solid
+            #d7e1eb;
+
+    border-radius: 16px;
+
+    outline: none;
+
+    background: #ffffff;
+
+    color: #20364d;
+
+    font-family: inherit;
+
+    font-size: 14px;
+
+    transition:
+            border-color .2s ease,
+            box-shadow .2s ease;
+
+}
+
+
+.composer input::placeholder {
+
+    color: #9daab8;
+
+}
+
+
+.composer input:focus {
+
+    border-color: #94afcc;
+
+    box-shadow:
+            0 0 0 4px
+            rgba(
+                    6,
+                    70,
+                    142,
+                    0.06
+            );
+
+}
+
+
+/* =========================================================
+   КНОПКА ОТПРАВКИ
+   ========================================================= */
+
+.composer button {
+
+    height: 48px;
+
+    flex-shrink: 0;
+
+    padding:
+            0
+            20px;
+
+    border: none;
+
+    border-radius: 16px;
+
+    background: #06468e;
+
+    color: #ffffff;
+
+    font-family: inherit;
+
+    font-size: 14px;
+
+    font-weight: 600;
+
+    cursor: pointer;
+
+    transition:
+            background .2s ease,
+            transform .2s ease,
+            box-shadow .2s ease;
+
+}
+
+
+.composer button:hover {
+
+    background: #03366f;
+
+    transform: translateY(-1px);
+
+    box-shadow:
+            0 5px 15px
+            rgba(
+                    0,
+                    43,
+                    94,
+                    0.18
+            );
+
+}
+
+
+.composer button:active {
+
+    transform: scale(.98);
+
+}
+
+
+/* =========================================================
+   СКРОЛЛБАР
+   ========================================================= */
+
+.messages::-webkit-scrollbar {
+
+    width: 7px;
+
+}
+
+
+.messages::-webkit-scrollbar-track {
+
+    background: transparent;
+
+}
+
+
+.messages::-webkit-scrollbar-thumb {
+
+    border-radius: 10px;
+
+    background: #c7d5e3;
+
+}
+
+
+.messages::-webkit-scrollbar-thumb:hover {
+
+    background: #aebfd0;
+
+}
+
+
+/* =========================================================
+   MOBILE
+   ========================================================= */
+
+@media (max-width: 600px) {
+
+    body {
+
+        padding: 0;
+
+    }
+
+
+    .chat-window {
+
+        width: 100%;
+
+        height: 100vh;
+
+        min-height: 100vh;
+
+        border: 0;
+
+        border-radius: 0;
+
+    }
+
+
+    .chat-header {
+
+        padding:
+                18px
+                16px;
+
+    }
+
+
+    .avatar-wrap {
+
+        width: 52px;
+
+        height: 52px;
+
+    }
+
+
+    .avatar-wrap img {
+
+        width: 48px;
+
+        height: 48px;
+
+    }
+
+
+    .title {
+
+        font-size: 19px;
+
+    }
+
+
+    .subtitle {
+
+        font-size: 11px;
+
+    }
+
+
+    .messages {
+
+        padding:
+                18px
+                14px;
+
+    }
+
+
+    .message {
+
+        max-width: 88%;
+
+        font-size: 13px;
+
+    }
+
+
+    .composer {
+
+        padding:
+                10px;
+
+    }
+
+
+    .composer input {
+
+        height: 46px;
+
+        font-size: 13px;
+
+    }
+
+
+    .composer button {
+
+        height: 46px;
+
+        padding:
+                0
+                14px;
+
+        font-size: 13px;
+
+    }
+
+}

@@ -1,0 +1,2299 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+)
+
+// =========================================================
+// CONFIG
+// =========================================================
+
+type Config struct {
+	Port        string
+	CORSOrigin  string
+	NOMOSBase   string
+	CacheTime   time.Duration
+	OllamaURL   string
+	OllamaModel string
+}
+
+func loadDotEnv(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		value = strings.Trim(value, `"'`)
+
+		if os.Getenv(key) == "" {
+			_ = os.Setenv(key, value)
+		}
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func loadConfig() Config {
+	loadDotEnv(".env")
+
+	return Config{
+		Port:        getEnv("PORT", "3000"),
+		CORSOrigin:  getEnv("CORS_ORIGIN", "*"),
+		NOMOSBase:   strings.TrimRight(getEnv("NOMOS_BASE_URL", "https://college-nomos.ru"), "/"),
+		CacheTime:   10 * time.Minute,
+		OllamaURL:   strings.TrimRight(getEnv("OLLAMA_URL", "http://127.0.0.1:11434"), "/"),
+		OllamaModel: getEnv("OLLAMA_MODEL", "qwen2.5:7b-instruct"), // Изменено с 3b на 7b
+	}
+}
+
+// =========================================================
+// HTTP TYPES
+// =========================================================
+
+type chatRequest struct {
+	Message   string `json:"message"`
+	Question  string `json:"question"`
+	Query     string `json:"query"`
+	SessionID string `json:"session_id,omitempty"` // Идентификатор сессии для сохранения контекста
+}
+
+type chatResponse struct {
+	Reply     string   `json:"reply"`
+	Sources   []Source `json:"sources,omitempty"`
+	SessionID string   `json:"session_id,omitempty"` // Возвращаем session_id клиенту
+}
+
+type errorResponse struct {
+	Error string `json:"error"`
+}
+
+// =========================================================
+// SOURCES
+// =========================================================
+
+type Source struct {
+	Name string
+	URL  string
+	Kind string
+}
+
+type CachedPage struct {
+	Text           string
+	Source         Source
+	UpdatedAt      time.Time
+	PublishedDate  string // Дата публикации материала (если известна)
+}
+
+func buildSources(base string) []Source {
+	base = strings.TrimRight(base, "/")
+
+	return []Source{
+		// Основные страницы
+		{Name: "Главная страница", URL: base + "/", Kind: "general"},
+		{Name: "Поступающим", URL: base + "/abitur/postupayushchim/", Kind: "admission"},
+		{Name: "Специальности (список)", URL: base + "/abitur/specialties/", Kind: "specialties"},
+		
+		// Официальная информация (Свед. об образовательной организации)
+		{Name: "Образование", URL: base + "/sveden/education/", Kind: "education"},
+		{Name: "Документы", URL: base + "/sveden/document/", Kind: "documents"},
+		{Name: "Платные услуги", URL: base + "/sveden/paid_edu/", Kind: "payment"},
+		{Name: "Материально-техническое обеспечение", URL: base + "/sveden/objects/", Kind: "facilities"},
+		{Name: "Стипендии и поддержка", URL: base + "/sveden/grants/", Kind: "grants"},
+		{Name: "Вакантные места", URL: base + "/sveden/vacant/", Kind: "admission"},
+		
+		// Сотрудники и преподаватели
+		{Name: "Преподаватели — страница 1", URL: base + "/teachers/", Kind: "teachers"},
+		{Name: "Преподаватели — страница 2", URL: base + "/teachers/?PAGEN_2=2", Kind: "teachers"},
+		{Name: "Сотрудники (руководство)", URL: base + "/sveden/employees/", Kind: "employees"},
+		
+		// Специальности (детали)
+		{Name: "Право и организация социального обеспечения", URL: base + "/abitur/specialties/40-02-01-pravo-i-organizatsiya-sotsialnogo-obespecheniya/", Kind: "specialty_detail"},
+		{Name: "Юриспруденция", URL: base + "/abitur/specialties/40-02-04-yurisprudentsiya/", Kind: "specialty_detail"},
+		{Name: "Преподавание в начальных классах", URL: base + "/abitur/specialties/44-02-02-prepodavanie-v-nachalnykh-klassakh/", Kind: "specialty_detail"},
+		{Name: "Дизайн", URL: base + "/abitur/specialties/54-02-01-dizayn/", Kind: "specialty_detail"},
+		
+		// Студентам (ВОССТАНОВЛЕНО)
+		{Name: "Студентам", URL: base + "/students/", Kind: "students"},
+		{Name: "Практика и стажировка", URL: base + "/students/practice/", Kind: "practice"},
+		{Name: "Расписание занятий", URL: base + "/students/schedule/", Kind: "schedule"},
+		{Name: "Образовательные ресурсы", URL: base + "/students/educational-resources/", Kind: "students"},
+		{Name: "Пересдачи и академическая задолженность", URL: base + "/retake/", Kind: "retake"},
+		
+		// Новости (первые 10 страниц)
+		{Name: "Новости", URL: base + "/press-center/news/", Kind: "news"},
+		{Name: "Новости — стр. 2", URL: base + "/press-center/news/?PAGEN_1=2", Kind: "news"},
+		{Name: "Новости — стр. 3", URL: base + "/press-center/news/?PAGEN_1=3", Kind: "news"},
+		{Name: "Новости — стр. 4", URL: base + "/press-center/news/?PAGEN_1=4", Kind: "news"},
+		{Name: "Новости — стр. 5", URL: base + "/press-center/news/?PAGEN_1=5", Kind: "news"},
+		{Name: "Новости — стр. 6", URL: base + "/press-center/news/?PAGEN_1=6", Kind: "news"},
+		{Name: "Новости — стр. 7", URL: base + "/press-center/news/?PAGEN_1=7", Kind: "news"},
+		{Name: "Новости — стр. 8", URL: base + "/press-center/news/?PAGEN_1=8", Kind: "news"},
+		{Name: "Новости — стр. 9", URL: base + "/press-center/news/?PAGEN_1=9", Kind: "news"},
+		{Name: "Новости — стр. 10", URL: base + "/press-center/news/?PAGEN_1=10", Kind: "news"},
+	}
+}
+
+// =========================================================
+// CHUNKING AND SEARCH
+// =========================================================
+
+type Chunk struct {
+	Text       string
+	Source     Source
+	StartIndex int
+	EndIndex   int
+}
+
+// Разбивает текст на семантические фрагменты с сохранением контекста
+func splitIntoChunks(text string, source Source, chunkSize int) []Chunk {
+	lines := strings.Split(text, "\n")
+	var chunks []Chunk
+	var currentChunk strings.Builder
+	var chunkStart int
+	lineIndex := 0
+	
+	// Буфер для сохранения заголовков специальностей
+	var lastSpecialtyHeader string
+	specialtyCodePattern := regexp.MustCompile(`(?i)(40\.02\.0[14]|44\.02\.02|54\.02\.01)`)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		
+		// Определяем, является ли строка заголовком специальности
+		isSpecialtyLine := specialtyCodePattern.MatchString(line) && 
+			(strings.Contains(strings.ToLower(line), "дизайн") ||
+			 strings.Contains(strings.ToLower(line), "юриспруденци") ||
+			 strings.Contains(strings.ToLower(line), "преподавани") ||
+			 strings.Contains(strings.ToLower(line), "право"))
+		
+		if isSpecialtyLine {
+			lastSpecialtyHeader = line
+		}
+
+		// Проверка переполнения chunk
+		willOverflow := currentChunk.Len() > 0 && currentChunk.Len()+len(line) > chunkSize
+		
+		// Если строка содержит цену, НЕ разрывать chunk
+		hasPriceInfo := strings.Contains(strings.ToLower(line), "стоимость") ||
+			strings.Contains(strings.ToLower(line), "оплата") ||
+			regexp.MustCompile(`\d{2,3}\s*\d{3}\s*руб`).MatchString(strings.ToLower(line))
+		
+		if willOverflow && !hasPriceInfo {
+			// Сохраняем текущий chunk
+			chunk := Chunk{
+				Text:       strings.TrimSpace(currentChunk.String()),
+				Source:     source,
+				StartIndex: chunkStart,
+				EndIndex:   lineIndex,
+			}
+			if chunk.Text != "" {
+				chunks = append(chunks, chunk)
+			}
+			currentChunk.Reset()
+			chunkStart = lineIndex
+			
+			// Если был сохранён заголовок специальности, добавляем его в новый chunk
+			if lastSpecialtyHeader != "" && !strings.Contains(line, lastSpecialtyHeader) {
+				currentChunk.WriteString(lastSpecialtyHeader)
+				currentChunk.WriteString("\n")
+			}
+		}
+
+		if currentChunk.Len() > 0 && !strings.HasSuffix(currentChunk.String(), "\n") {
+			currentChunk.WriteString("\n")
+		}
+		currentChunk.WriteString(line)
+		lineIndex++
+	}
+
+	// Сохраняем последний фрагмент
+	if currentChunk.Len() > 0 {
+		chunk := Chunk{
+			Text:       strings.TrimSpace(currentChunk.String()),
+			Source:     source,
+			StartIndex: chunkStart,
+			EndIndex:   lineIndex,
+		}
+		if chunk.Text != "" {
+			chunks = append(chunks, chunk)
+		}
+	}
+
+	return chunks
+}
+
+// Простой BM25-подобный скоринг фрагментов
+func scoreChunk(chunk Chunk, terms []string) float64 {
+	if len(terms) == 0 {
+		return 0
+	}
+
+	text := normalize(chunk.Text)
+	score := 0.0
+
+	for _, term := range terms {
+		// Подсчет вхождений термина
+		count := float64(strings.Count(text, term))
+		if count > 0 {
+			// TF (term frequency) с насыщением
+			tf := count / (count + 1.0)
+			score += tf
+		}
+	}
+
+	// Бонус за длину фрагмента (более длинные фрагменты предпочтительнее при равном скоре)
+	lengthBonus := float64(len(chunk.Text)) / 10000.0
+	score += lengthBonus * 0.1
+
+	return score
+}
+
+// Поиск топ-N релевантных фрагментов
+func findRelevantChunks(pages []CachedPage, question string, limit int) []Chunk {
+	terms := questionTerms(normalize(question))
+	if len(terms) == 0 {
+		// Если нет ключевых слов, возвращаем первые N фрагментов
+		var allChunks []Chunk
+		for _, page := range pages {
+			chunks := splitIntoChunks(page.Text, page.Source, 3000)
+			allChunks = append(allChunks, chunks...)
+		}
+		if len(allChunks) > limit {
+			return allChunks[:limit]
+		}
+		return allChunks
+	}
+
+	// Разбиваем все страницы на фрагменты
+	type scoredChunk struct {
+		chunk Chunk
+		score float64
+	}
+	
+	var scored []scoredChunk
+	for _, page := range pages {
+		chunks := splitIntoChunks(page.Text, page.Source, 3000)
+		for _, chunk := range chunks {
+			s := scoreChunk(chunk, terms)
+			if s > 0 {
+				scored = append(scored, scoredChunk{chunk: chunk, score: s})
+			}
+		}
+	}
+
+	// Сортируем по убыванию скора
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+
+	// Берем топ-N
+	n := limit
+	if len(scored) < n {
+		n = len(scored)
+	}
+
+	result := make([]Chunk, n)
+	for i := 0; i < n; i++ {
+		result[i] = scored[i].chunk
+	}
+
+	return result
+}
+
+// =========================================================
+// HTTP CLIENT + CACHE
+// =========================================================
+
+var httpClient = &http.Client{
+	Timeout: 120 * time.Second, // Увеличено для Ollama (загрузка модели + генерация)
+}
+
+var pageCache = struct {
+	sync.RWMutex
+	items map[string]CachedPage
+}{
+	items: make(map[string]CachedPage),
+}
+
+func fetchPage(ctx context.Context, source Source, cacheTime time.Duration) (CachedPage, error) {
+	pageCache.RLock()
+	cached, ok := pageCache.items[source.URL]
+	pageCache.RUnlock()
+
+	if ok && time.Since(cached.UpdatedAt) < cacheTime {
+		return cached, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source.URL, nil)
+	if err != nil {
+		return CachedPage{}, err
+	}
+
+	req.Header.Set("User-Agent", "Erudit/3.0")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.Header.Set("Accept-Charset", "utf-8")
+
+	log.Printf("NOMOS URL: %s", req.URL.String())
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return CachedPage{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("NOMOS ERROR: HTTP %d, URL: %s", resp.StatusCode, req.URL.String())
+		return CachedPage{}, fmt.Errorf("NOMOS HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 15*1024*1024))
+	if err != nil {
+		return CachedPage{}, err
+	}
+
+	// Конвертируем HTML в строку с учетом кодировки
+	htmlContent := decodeHTML(body, resp.Header.Get("Content-Type"))
+	extractedText := extractTextFromHTML(htmlContent)
+	
+	log.Printf("NOMOS CONTENT: URL=%s, HTML=%d bytes, Text=%d chars", 
+		req.URL.String(), len(body), len(extractedText))
+
+	page := CachedPage{
+		Text:      extractedText,
+		Source:    source,
+		UpdatedAt: time.Now(),
+	}
+
+	pageCache.Lock()
+	pageCache.items[source.URL] = page
+	pageCache.Unlock()
+
+	return page, nil
+}
+
+// =========================================================
+// HTML -> TEXT
+// =========================================================
+
+// decodeHTML конвертирует байты HTML в строку UTF-8 с учетом кодировки
+func decodeHTML(body []byte, contentType string) string {
+	// Проверяем Content-Type на наличие charset
+	contentType = strings.ToLower(contentType)
+	
+	// Сначала проверяем валидность UTF-8
+	isValidUTF8 := utf8.Valid(body)
+	
+	// Пытаемся найти charset в Content-Type
+	if strings.Contains(contentType, "charset=") {
+		parts := strings.Split(contentType, "charset=")
+		if len(parts) > 1 {
+			charset := strings.TrimSpace(strings.Split(parts[1], ";")[0])
+			log.Printf("Detected charset from Content-Type: %s", charset)
+			
+			// Если явно указан UTF-8
+			if strings.Contains(charset, "utf-8") {
+				if isValidUTF8 {
+					log.Printf("UTF-8 validation passed, using as-is")
+					return string(body)
+				} else {
+					// UTF-8 с ошибками - очищаем невалидные последовательности
+					log.Printf("UTF-8 with invalid sequences, cleaning up")
+					return strings.ToValidUTF8(string(body), "")
+				}
+			}
+			
+			// Если это windows-1251, конвертируем
+			if strings.Contains(charset, "windows-1251") || strings.Contains(charset, "cp1251") {
+				return decodeWindows1251(body)
+			}
+		}
+	}
+	
+	// Проверяем на валидность UTF-8
+	if isValidUTF8 {
+		log.Printf("UTF-8 validation passed, using as-is")
+		return string(body)
+	}
+	
+	// Проверяем meta-тег для невалидного UTF-8
+	checkLen := 2000
+	if len(body) < checkLen {
+		checkLen = len(body)
+	}
+	
+	// Используем ToValidUTF8 для безопасного чтения начала
+	htmlStart := strings.ToValidUTF8(string(body[:checkLen]), "")
+	
+	// <meta charset="...">
+	charsetRe := regexp.MustCompile(`(?i)<meta[^>]+charset\s*=\s*["']?([^"'\s>]+)`)
+	if matches := charsetRe.FindStringSubmatch(htmlStart); len(matches) > 1 {
+		charset := strings.ToLower(matches[1])
+		log.Printf("Detected charset from meta tag: %s", charset)
+		
+		if strings.Contains(charset, "utf-8") {
+			// Meta говорит UTF-8, но есть невалидные байты - очищаем
+			log.Printf("Meta says UTF-8, cleaning invalid sequences")
+			return strings.ToValidUTF8(string(body), "")
+		}
+		
+		if strings.Contains(charset, "windows-1251") || strings.Contains(charset, "cp1251") {
+			return decodeWindows1251(body)
+		}
+	}
+	
+	// По умолчанию пробуем очистить как UTF-8
+	log.Printf("No explicit charset found, trying UTF-8 cleanup")
+	cleaned := strings.ToValidUTF8(string(body), "")
+	
+	// Если после очистки слишком много потерялось, пробуем windows-1251
+	if len(cleaned) < len(body)*8/10 {
+		log.Printf("Too much data lost in UTF-8 cleanup, trying windows-1251")
+		return decodeWindows1251(body)
+	}
+	
+	return cleaned
+}
+
+// decodeWindows1251 конвертирует windows-1251 в UTF-8
+func decodeWindows1251(data []byte) string {
+	// Таблица конвертации windows-1251 -> UTF-8 для русских букв
+	buf := make([]rune, 0, len(data))
+	
+	for _, b := range data {
+		switch {
+		case b < 0x80:
+			// ASCII без изменений
+			buf = append(buf, rune(b))
+		case b >= 0xC0 && b <= 0xDF:
+			// А-Я: 0xC0-0xDF -> U+0410-U+042F
+			buf = append(buf, rune(0x0410+int(b)-0xC0))
+		case b >= 0xE0 && b <= 0xFF:
+			// а-я: 0xE0-0xFF -> U+0430-U+044F
+			buf = append(buf, rune(0x0430+int(b)-0xE0))
+		case b == 0xA8:
+			// Ё
+			buf = append(buf, 'Ё')
+		case b == 0xB8:
+			// ё
+			buf = append(buf, 'ё')
+		default:
+			// Остальные символы оставляем как есть
+			buf = append(buf, rune(b))
+		}
+	}
+	
+	return string(buf)
+}
+
+func extractTextFromHTML(source string) string {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`),
+		regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`),
+		regexp.MustCompile(`(?is)<noscript[^>]*>.*?</noscript>`),
+		regexp.MustCompile(`(?is)<svg[^>]*>.*?</svg>`),
+		regexp.MustCompile(`(?s)<!--.*?-->`),
+	}
+
+	for _, re := range patterns {
+		source = re.ReplaceAllString(source, "\n")
+	}
+
+	blockTags := regexp.MustCompile(`(?i)</?(p|div|section|article|li|h1|h2|h3|h4|h5|h6|tr|br|td|th|ul|ol|main|header|footer|table)[^>]*>`)
+	source = blockTags.ReplaceAllString(source, "\n")
+
+	tags := regexp.MustCompile(`(?s)<[^>]+>`)
+	source = tags.ReplaceAllString(source, " ")
+	source = html.UnescapeString(source)
+	source = strings.ReplaceAll(source, "\u00a0", " ")
+
+	lines := strings.Split(source, "\n")
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(line), " ")
+		line = strings.TrimSpace(line)
+		if line != "" {
+			clean = append(clean, line)
+		}
+	}
+
+	return strings.Join(clean, "\n")
+}
+
+// =========================================================
+// TEXT HELPERS
+// =========================================================
+
+func normalize(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "ё", "е")
+	// Убираем знаки препинания
+	s = strings.NewReplacer(
+		".", " ", ",", " ", "!", " ", "?", " ", ":", " ", ";", " ",
+		"(", " ", ")", " ", "-", " ", "—", " ", "/", " ", "\"", " ", "'", " ",
+	).Replace(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func tokenize(s string) []string {
+	s = normalize(s)
+	s = strings.NewReplacer(
+		".", " ", ",", " ", "!", " ", "?", " ", ":", " ", ";", " ",
+		"(", " ", ")", " ", "-", " ", "—", " ", "/", " ",
+	).Replace(s)
+	return strings.Fields(s)
+}
+
+func containsAny(s string, words ...string) bool {
+	for _, word := range words {
+		if strings.Contains(s, word) {
+			return true
+		}
+	}
+	return false
+}
+
+// =========================================================
+// QUESTION ROUTING
+// =========================================================
+
+func isNewsQuestion(q string) bool {
+	q = normalize(q)
+	return containsAny(q,
+		"новост",
+		"что нового",
+		"последние события",
+		"события в колледже",
+		"последние новости",
+		"свежие новости",
+		"что произошло",
+	)
+}
+
+func isTeacherQuestion(q string) bool {
+	q = normalize(q)
+
+	// Явные вопросы о преподавателях.
+	if containsAny(q,
+		"преподавател",
+		"преподает",
+		"преподаёт",
+		"кто ведет",
+		"кто ведёт",
+		"кто преподает",
+		"кто преподаёт",
+		"учитель",
+		"учителя",
+		"педагог",
+	) {
+		return true
+	}
+
+	// «Кто + предмет» тоже считаем вопросом о преподавателе,
+	// но сам предмет без «кто» больше не отправляем в этот режим.
+	if strings.Contains(q, "кто") && containsAny(q,
+		"информатик",
+		"математик",
+		"истори",
+		"физик",
+		"географ",
+		"английск",
+		"дизайн",
+		"юриспруден",
+	) {
+		return true
+	}
+
+	return false
+}
+
+func isSpecialtyQuestion(q string) bool {
+	return containsAny(q,
+		"специальност",
+		"специальность",
+		"направлен",
+		"направление",
+		"40.02.01",
+		"40.02.04",
+		"44.02.02",
+		"54.02.01",
+		"юриспруден",
+		"право и организация социального обеспечения",
+		"социального обеспечения",
+		"преподавание в начальных классах",
+		"начальных классах",
+		"дизайн",
+	)
+}
+
+func sourceScore(source Source, q string) int {
+	score := 0
+
+	// Новости
+	if isNewsQuestion(q) {
+		if source.Kind == "news" {
+			score += 150
+		}
+	}
+	
+	// Преподаватели
+	if isTeacherQuestion(q) {
+		if source.Kind == "teachers" {
+			score += 100
+		}
+	}
+	
+	// Специальности
+	if isSpecialtyQuestion(q) {
+		if source.Kind == "specialties" || source.Kind == "specialty_detail" {
+			score += 100
+		}
+	}
+	
+	// Поступление, стоимость, экзамены
+	if containsAny(q, "поступ", "прием", "приемная", "документ", "стоим", "цен", "экзамен") {
+		if source.Kind == "admission" {
+			score += 100
+		}
+		// ИСПРАВЛЕНИЕ: если вопрос о стоимости конкретной специальности,
+		// добавляем баллы карточке этой специальности
+		if containsAny(q, "стоим", "цен") {
+			if source.Kind == "specialty_detail" {
+				score += 80
+			}
+			if source.Kind == "payment" {
+				score += 120
+			}
+			if source.Kind == "specialties" {
+				score += 90
+			}
+		}
+	}
+	
+	// Образование
+	if containsAny(q, "образован", "учебный план", "дисциплин", "предмет") {
+		if source.Kind == "education" || source.Kind == "specialty_detail" {
+			score += 60
+		}
+	}
+	
+	// Материально-техническое обеспечение
+	if containsAny(q, "кабинет", "библиотек", "спорт", "оборудован", "здание") {
+		if source.Kind == "facilities" {
+			score += 100
+		}
+	}
+	
+	// Документы
+	if containsAny(q, "документ", "приказ", "положение") {
+		if source.Kind == "documents" {
+			score += 100
+		}
+	}
+
+	return score
+}
+
+func chooseSources(sources []Source, question string) []Source {
+	q := normalize(question)
+
+	// Новости: весь раздел новостей с пагинацией.
+	if isNewsQuestion(q) {
+		var result []Source
+		for _, source := range sources {
+			if source.Kind == "news" {
+				result = append(result, source)
+			}
+		}
+		return result
+	}
+
+	// Преподаватели: только две страницы преподавателей.
+
+	if isTeacherQuestion(q) {
+		var result []Source
+		for _, source := range sources {
+			if source.Kind == "teachers" {
+				result = append(result, source)
+			}
+		}
+		return result
+	}
+
+	// Специальности: если в вопросе названа конкретная специальность,
+	// загружаем ТОЛЬКО её страницу + при необходимости индекс.
+	if isSpecialtyQuestion(q) {
+		if isGenericSpecialtyListQuestion(q) {
+			var result []Source
+			for _, source := range sources {
+				if source.Kind == "specialties" {
+					result = append(result, source)
+				}
+			}
+			return result
+		}
+
+		var result []Source
+		for _, source := range sources {
+			if source.Kind != "specialty_detail" {
+				continue
+			}
+			if specialtyMatchesQuestion(q, source.Name) {
+				result = append(result, source)
+			}
+		}
+
+		// ИСПРАВЛЕНИЕ: если вопрос о стоимости конкретной специальности,
+		// добавляем страницу "Поступающим" где есть все цены
+		if containsAny(q, "стоим", "цен") && len(result) > 0 {
+			for _, source := range sources {
+				if source.Kind == "admission" {
+					result = append(result, source)
+					break
+				}
+			}
+		}
+
+		// Если пользователь спрашивает «про специальности» без явного названия,
+		// берём индекс и все четыре карточки.
+		if len(result) == 0 {
+			for _, source := range sources {
+				if source.Kind == "specialties" || source.Kind == "specialty_detail" {
+					result = append(result, source)
+				}
+			}
+		}
+		return uniqueSources(result)
+	}
+
+	type scoredSource struct {
+		source Source
+		score  int
+	}
+
+	var scored []scoredSource
+	for _, source := range sources {
+		s := sourceScore(source, q)
+		if s > 0 {
+			scored = append(scored, scoredSource{source: source, score: s})
+		}
+	}
+
+	if len(scored) == 0 {
+		// Без уверенного совпадения берём главную и поступление,
+		// а не случайные страницы.
+		for _, source := range sources {
+			if source.Kind == "general" || source.Kind == "admission" {
+				scored = append(scored, scoredSource{source: source, score: 1})
+			}
+		}
+	}
+
+	sort.SliceStable(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+
+	// ИСПРАВЛЕНИЕ: для общих вопросов о стоимости увеличиваем лимит,
+	// чтобы захватить и "Поступающим" и карточки специальностей
+	limit := 3
+	if containsAny(q, "стоим", "цен") && !isSpecialtyQuestion(q) {
+		limit = 6 // Поступающим + 4 специальности + запас
+	}
+	
+	if len(scored) < limit {
+		limit = len(scored)
+	}
+
+	result := make([]Source, 0, limit)
+	for _, item := range scored[:limit] {
+		result = append(result, item.source)
+	}
+	return uniqueSources(result)
+}
+
+func uniqueSources(sources []Source) []Source {
+	seen := make(map[string]bool, len(sources))
+	result := make([]Source, 0, len(sources))
+	for _, source := range sources {
+		if seen[source.URL] {
+			continue
+		}
+		seen[source.URL] = true
+		result = append(result, source)
+	}
+	return result
+}
+
+func titleMatchesSpecialty(q, name string) bool {
+	return specialtyMatchesQuestion(q, name)
+}
+
+func specialtyMatchesQuestion(q, name string) bool {
+	q = normalize(q)
+	n := normalize(name)
+
+	pairs := [][2]string{
+		{"40.02.01", "право и организация социального обеспечения"},
+		{"40.02.04", "юриспруденция"},
+		{"44.02.02", "преподавание в начальных классах"},
+		{"54.02.01", "дизайн"},
+	}
+
+	for _, pair := range pairs {
+		if (strings.Contains(q, pair[0]) || strings.Contains(q, pair[1])) &&
+			(strings.Contains(n, pair[0]) || strings.Contains(n, pair[1])) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func questionTerms(q string) []string {
+	stop := map[string]bool{
+		"кто": true, "что": true, "как": true, "какой": true, "какая": true, "какие": true,
+		"есть": true, "можно": true, "ли": true, "на": true, "по": true, "для": true,
+		"про": true, "расскажи": true, "подробно": true, "мне": true, "нужно": true,
+		"колледж": true, "колледже": true,
+		// УЛУЧШЕНИЕ: убираем "специальность", "преподаватель", "новости" из стоп-слов
+	}
+
+	seen := map[string]bool{}
+	var result []string
+	for _, word := range tokenize(q) {
+		// УЛУЧШЕНИЕ: минимум 3 символа вместо 4
+		if len([]rune(word)) < 3 || stop[word] || seen[word] {
+			continue
+		}
+		seen[word] = true
+		result = append(result, word)
+	}
+	
+	// УЛУЧШЕНИЕ: добавляем словоформы и синонимы
+	expanded := expandTerms(result)
+	return expanded
+}
+
+// expandTerms добавляет словоформы и синонимы для улучшения поиска
+func expandTerms(terms []string) []string {
+	synonyms := map[string][]string{
+		"стоимост":      {"стоимост", "цен", "оплат", "тариф", "плат"},
+		"цен":           {"цен", "стоимост", "оплат", "плат"},
+		"оплат":         {"оплат", "стоимост", "цен", "плат"},
+		"юриспруденци":  {"юриспруденци", "юрист", "юридическ", "прав"},
+		"юрист":         {"юрист", "юриспруденци", "юридическ"},
+		"дизайн":        {"дизайн", "дизайнер"},
+		"дизайнер":      {"дизайнер", "дизайн"},
+		"преподавани":   {"преподавани", "преподавател", "учител"},
+		"преподавател":  {"преподавател", "преподавани", "учител"},
+		"учител":        {"учител", "преподавател", "преподавани"},
+		"медиацентр":    {"медиацентр", "медиа-центр", "медиа", "пресс-центр", "пресс"},
+		"практик":       {"практик", "практическ", "производственн"},
+	}
+	
+	seen := make(map[string]bool)
+	var expanded []string
+	
+	for _, term := range terms {
+		if !seen[term] {
+			expanded = append(expanded, term)
+			seen[term] = true
+		}
+		
+		// Добавляем синонимы и словоформы
+		for key, values := range synonyms {
+			if strings.HasPrefix(term, key) || strings.HasPrefix(key, term) {
+				for _, syn := range values {
+					if !seen[syn] && syn != term {
+						expanded = append(expanded, syn)
+						seen[syn] = true
+					}
+				}
+				break
+			}
+		}
+	}
+	
+	return expanded
+}
+
+// =========================================================
+// CONTEXT
+// =========================================================
+
+func loadContext(ctx context.Context, sources []Source, question string, cacheTime time.Duration) (string, []Source, error) {
+	selected := chooseSources(sources, question)
+	if len(selected) == 0 {
+		return "", nil, errors.New("не выбраны источники NOMOS")
+	}
+
+	type result struct {
+		page CachedPage
+		err  error
+	}
+
+	// Сохраняем порядок selected: канал с конкурентными запросами давал
+	// случайный порядок и из-за лимита контекста модель иногда видела только одну страницу.
+	results := make([]result, len(selected))
+	var wg sync.WaitGroup
+
+	for i, source := range selected {
+		wg.Add(1)
+		go func(index int, src Source) {
+			defer wg.Done()
+			page, err := fetchPage(ctx, src, cacheTime)
+			results[index] = result{page: page, err: err}
+		}(i, source)
+	}
+	wg.Wait()
+
+	var pages []CachedPage
+	for _, item := range results {
+		if item.err != nil {
+			log.Printf("Источник не загрузился: %s: %v", item.page.Source.URL, item.err)
+			continue
+		}
+		pages = append(pages, item.page)
+	}
+
+	if len(pages) == 0 {
+		return "", nil, errors.New("не удалось загрузить ни одной страницы NOMOS")
+	}
+
+	questionLower := normalize(question)
+	
+	// Используем RAG (chunking + поиск) для улучшения релевантности
+	useRAG := true
+	if isNewsQuestion(questionLower) {
+		// Для новостей лучше работает старый подход
+		useRAG = false
+	}
+
+	var builder strings.Builder
+	builder.WriteString("КОНТЕКСТ С ОФИЦИАЛЬНОГО САЙТА КОЛЛЕДЖА «НОМОС»\n\n")
+	
+	if useRAG {
+		// RAG режим: находим релевантные фрагменты
+		chunks := findRelevantChunks(pages, question, 15) // Топ-15 релевантных фрагментов
+		
+		builder.WriteString("Ниже представлены фрагменты материалов, релевантные вопросу пользователя.\n")
+		builder.WriteString("Используй ТОЛЬКО факты из этих фрагментов для ответа.\n\n")
+		
+		seenSources := make(map[string]bool)
+		totalChars := 0
+		maxTotal := 80000
+		
+		for i, chunk := range chunks {
+			if totalChars+len(chunk.Text) > maxTotal {
+				break
+			}
+			
+			fmt.Fprintf(&builder, "--- ФРАГМЕНТ %d: %s ---\n", i+1, chunk.Source.Name)
+			builder.WriteString(chunk.Text)
+			builder.WriteString("\n\n")
+			
+			totalChars += len(chunk.Text)
+			seenSources[chunk.Source.URL] = true
+		}
+		
+		// Собираем уникальные источники
+		var usedSources []Source
+		for _, page := range pages {
+			if seenSources[page.Source.URL] {
+				usedSources = append(usedSources, page.Source)
+			}
+		}
+		
+		log.Printf("RAG: использовано %d фрагментов, %d символов из %d источников", len(chunks), totalChars, len(usedSources))
+		return builder.String(), usedSources, nil
+	}
+
+	// Старый режим: полные страницы
+	builder.WriteString("ВАЖНО: блоки ниже относятся к вопросу пользователя; используй только релевантные факты.\n\n")
+
+	maxPerPage := 20000  // Увеличено с 12000
+	maxTotal := 80000    // Увеличено с 24000 для поддержки num_ctx=32768
+	if isNewsQuestion(questionLower) {
+		maxPerPage = 4000  // Увеличено с 2500
+		maxTotal = 40000   // Увеличено с 30000
+	}
+	total := 0
+
+	for _, page := range pages {
+		text := focusPageText(page, question, maxPerPage)
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		if total+len(text) > maxTotal {
+			remain := maxTotal - total
+			if remain <= 0 {
+				break
+			}
+			text = text[:remain]
+		}
+
+		fmt.Fprintf(&builder, "=== ИСТОЧНИК: %s ===\n", page.Source.Name)
+		builder.WriteString(text)
+		builder.WriteString("\n\n")
+		total += len(text)
+	}
+
+	return builder.String(), pagesToSources(pages), nil
+}
+
+func focusPageText(page CachedPage, question string, limit int) string {
+	text := page.Text
+	q := normalize(question)
+
+	if page.Source.Kind == "news" {
+		return focusNewsText(text, q, limit)
+	}
+
+	if page.Source.Kind == "teachers" {
+		return focusTeacherText(text, q, limit)
+	}
+
+	if page.Source.Kind == "teachers" {
+		return focusTeacherText(text, q, limit)
+	}
+
+	if page.Source.Kind == "specialty_detail" {
+		// Если это конкретная специальность, не режем страницу по одному ключевому слову:
+		// важная информация может находиться далеко ниже.
+		if specialtyMatchesQuestion(q, page.Source.Name) || containsAny(q, "подробно", "все", "сравни", "дисциплин", "практик", "квалификац", "срок") {
+			return trimRunes(text, limit)
+		}
+	}
+
+	return trimRunes(text, limit)
+}
+
+func focusNewsText(text, q string, limit int) string {
+	lines := strings.Split(text, "\n")
+	var b strings.Builder
+
+	dateRE := regexp.MustCompile(`^(0?[1-9]|[12]\d|3[01])\.(0?[1-9]|1[0-2])\.20\d\d$`)
+	generic := q == "новости" || q == "последние новости" || q == "свежие новости" || q == "что нового"
+	terms := questionTerms(q)
+
+	var date, title string
+	var snippet []string
+	seen := make(map[string]bool)
+
+	flush := func() {
+		if title == "" {
+			date, title, snippet = "", "", nil
+			return
+		}
+		block := strings.TrimSpace(strings.Join(snippet, " "))
+		lower := normalize(title + " " + block)
+		match := generic
+		if !generic {
+			for _, term := range terms {
+				if strings.Contains(lower, term) {
+					match = true
+					break
+				}
+			}
+		}
+		key := normalize(title) + "|" + date
+		if match && !seen[key] {
+			seen[key] = true
+			if date != "" {
+				b.WriteString(date)
+				b.WriteByte('\n')
+			}
+			b.WriteString(title)
+			b.WriteByte('\n')
+			if block != "" {
+				b.WriteString(block)
+				b.WriteByte('\n')
+			}
+			b.WriteByte('\n')
+		}
+		date, title, snippet = "", "", nil
+	}
+
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if dateRE.MatchString(line) {
+			flush()
+			date = line
+			continue
+		}
+		if date != "" && title == "" && len([]rune(line)) >= 8 && len([]rune(line)) <= 180 {
+			if !containsAny(normalize(line), "выберите", "следующая", "предыдущая", "select") {
+				title = line
+				continue
+			}
+		}
+		if title != "" {
+			snippet = append(snippet, line)
+		}
+	}
+	flush()
+
+	if strings.TrimSpace(b.String()) == "" {
+		return trimRunes(text, limit)
+	}
+	return trimRunes(b.String(), limit)
+}
+
+func focusTeacherText(text, q string, limit int) string {
+	lines := strings.Split(text, "\n")
+	nameRE := regexp.MustCompile(`^[А-ЯЁ][а-яё-]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё-]+$`)
+
+	type record struct {
+		name  string
+		text  string
+		score int
+	}
+
+	var records []record
+	current := ""
+	var chunk []string
+	terms := questionTerms(q)
+	generic := isGenericTeacherQuestion(q)
+
+	flush := func() {
+		if current == "" {
+			chunk = nil
+			return
+		}
+		recordText := strings.TrimSpace(strings.Join(chunk, "\n"))
+		score := 0
+		lower := normalize(recordText)
+		for _, term := range terms {
+			if strings.Contains(lower, term) {
+				score++
+			}
+		}
+		if generic {
+			score = 1
+		}
+		records = append(records, record{name: current, text: recordText, score: score})
+		chunk = nil
+	}
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if nameRE.MatchString(line) {
+			flush()
+			current = line
+			chunk = append(chunk, line)
+			continue
+		}
+		if current != "" {
+			chunk = append(chunk, line)
+		}
+	}
+	flush()
+
+	// Для конкретного предмета берём только совпавшие карточки.
+	if !generic {
+		filtered := records[:0]
+		for _, r := range records {
+			if r.score > 0 {
+				filtered = append(filtered, r)
+			}
+		}
+		records = filtered
+	}
+
+	var b strings.Builder
+	for _, r := range records {
+		// Сжимаем карточку до сути: ФИО + строка предметов + контакты при наличии.
+		lines := strings.Split(r.text, "\n")
+		for _, line := range lines {
+			lower := normalize(line)
+			if line == r.name ||
+				strings.Contains(lower, "преподаваемые учебные предметы") ||
+				strings.Contains(lower, "контактный телефон") ||
+				strings.Contains(lower, "адрес электронной почты") {
+				b.WriteString(line)
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteByte('\n')
+		if b.Len() >= limit {
+			break
+		}
+	}
+
+	return trimRunes(b.String(), limit)
+}
+
+func isGenericTeacherQuestion(q string) bool {
+	q = normalize(q)
+	return q == "преподаватели" ||
+		q == "преподаватель" ||
+		q == "список преподавателей" ||
+		q == "какие преподаватели" ||
+		q == "какие преподаватели есть" ||
+		q == "кто работает преподавателем"
+}
+
+func trimRunes(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	r := []rune(text)
+	if len(r) <= limit {
+		return text
+	}
+	return string(r[:limit])
+}
+
+func pagesToSources(pages []CachedPage) []Source {
+	result := make([]Source, 0, len(pages))
+	seen := map[string]bool{}
+	for _, page := range pages {
+		if seen[page.Source.URL] {
+			continue
+		}
+		seen[page.Source.URL] = true
+		result = append(result, page.Source)
+	}
+	return result
+}
+
+// =========================================================
+// OLLAMA
+// =========================================================
+
+type OllamaGenerateRequest struct {
+	Model     string         `json:"model"`
+	Prompt    string         `json:"prompt"`
+	System    string         `json:"system,omitempty"`
+	Stream    bool           `json:"stream"`
+	Options   map[string]any `json:"options,omitempty"`
+	KeepAlive string         `json:"keep_alive,omitempty"`
+}
+
+type OllamaGenerateResponse struct {
+	Model      string `json:"model"`
+	Response   string `json:"response"`
+	Done       bool   `json:"done"`
+	DoneReason string `json:"done_reason"`
+}
+
+type OllamaTagsResponse struct {
+	Models []struct {
+		Name string `json:"name"`
+	} `json:"models"`
+}
+
+func pickOllamaModel(ctx context.Context, cfg Config) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.OllamaURL+"/api/tags", nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("Ollama недоступна по %s: %w", cfg.OllamaURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("Ollama /api/tags вернула HTTP %d", resp.StatusCode)
+	}
+
+	var tags OllamaTagsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		return "", fmt.Errorf("не удалось прочитать список моделей Ollama: %w", err)
+	}
+
+	if len(tags.Models) == 0 {
+		return "", errors.New("в Ollama нет установленной модели; установи модель командой ollama pull <имя>")
+	}
+
+	if cfg.OllamaModel != "" {
+		for _, item := range tags.Models {
+			if strings.EqualFold(item.Name, cfg.OllamaModel) {
+				return item.Name, nil
+			}
+		}
+		log.Printf("OLLAMA MODEL %q не найдена, использую %q", cfg.OllamaModel, tags.Models[0].Name)
+	}
+
+	return tags.Models[0].Name, nil
+}
+
+func buildAnswerInstructions(question string) string {
+	q := normalize(question)
+	mode := "общий вопрос"
+	if isNewsQuestion(q) {
+		mode = "новости"
+	} else if isTeacherQuestion(q) {
+		mode = "преподаватели"
+	} else if isSpecialtyQuestion(q) {
+		if isGenericSpecialtyListQuestion(q) {
+			mode = "список специальностей"
+		} else if containsAny(q, "сравни", "сравнение", "разница", "отличаются") {
+			mode = "сравнение специальностей"
+		} else {
+			mode = "конкретная специальность"
+		}
+	}
+
+	terms := questionTerms(q)
+
+	var b strings.Builder
+	b.WriteString(`Ты — Эрудит, помощник Воронежского колледжа «Номос».
+
+ГЛАВНЫЕ ПРИНЦИПЫ:
+1. Используй ТОЛЬКО факты из предоставленного контекста
+2. НЕ придумывай информацию, которой нет в контексте
+3. Можешь обобщать, объяснять и делать выводы на основе фактов из контекста
+4. НЕ требуй дословного совпадения — если смысл есть в контексте, отвечай уверенно
+
+КОГДА ОТВЕЧАТЬ УВЕРЕННО:
+- Факты о колледже явно написаны в контексте → отвечай прямо и полно
+- Можешь объяснить своими словами на основе контекста
+- Можешь дать общие рекомендации, подтвержденные контекстом
+- Если несколько фрагментов дополняют друг друга → объедини информацию
+
+КОГДА ГОВОРИТЬ "НЕ НАШЁЛ":
+- Информации действительно нет ни в одном фрагменте контекста
+- Не пытайся угадывать или фантазировать
+- Скажи: "На предоставленных материалах колледжа я не нашёл информации по этому вопросу."
+
+ЧАСТИЧНАЯ ИНФОРМАЦИЯ:
+- Если есть ответ на часть вопроса → дай эту информацию
+- Укажи, какой конкретно информации не хватает
+- Предложи полезный следующий шаг (контакты приемной комиссии)
+
+СТОИМОСТЬ ОБУЧЕНИЯ (КРИТИЧЕСКИ ВАЖНО):
+- 54.02.01 Дизайн = 139 200 рублей
+- 40.02.04 Юриспруденция = 80 000 рублей  
+- 44.02.02 Преподавание в начальных классах = своя цена
+- 40.02.01 Право и организация социального обеспечения = своя цена
+- ВСЕГДА проверяй КОД специальности (54.02.01, 40.02.04 и т.д.)
+- НЕ ПУТАЙ цены разных специальностей
+- Если вопрос про одну специальность — отвечай ТОЛЬКО про неё
+
+ПРЕПОДАВАТЕЛИ:
+- Если в контексте есть список — перечисли ФИО
+- Указывай предметы/должности, если они есть в контексте
+- Не придумывай преподавателей
+
+СТИЛЬ ОТВЕТА:
+- Отвечай естественным языком, как будто говоришь с человеком
+- Без вступлений "Согласно...", "Я нашёл...", "На основании контекста..."
+- Без Markdown (**, ##, ---)
+- Без URL и технических деталей
+- Простые списки и абзацы
+- Отвечай именно на заданный вопрос, не добавляй лишнего
+- На эмоциональные вопросы (беспокойство, тревога) отвечай спокойно и по существу
+
+ВОПРОСЫ ВНЕ ТЕМЫ КОЛЛЕДЖА:
+- Погода, общие знания → вежливо скажи, что отвечаешь только про колледж
+- НЕ используй фразу "не нашёл информации" для таких вопросов
+`)
+
+	fmt.Fprintf(&b, "\nРЕЖИМ ВОПРОСА: %s\n", mode)
+	if len(terms) > 0 {
+		fmt.Fprintf(&b, "КЛЮЧЕВЫЕ СЛОВА ВОПРОСА: %s\n", strings.Join(terms, ", "))
+	}
+
+	if isNewsQuestion(q) {
+		b.WriteString(`
+ДОПОЛНИТЕЛЬНО ДЛЯ НОВОСТЕЙ:
+- Покажи несколько последних новостей с датами
+- Указывай название и краткое содержание каждой новости
+- Не придумывай детали, которых нет в контексте
+`)
+	}
+
+	if isTeacherQuestion(q) {
+		b.WriteString(`
+ДОПОЛНИТЕЛЬНО ДЛЯ ПРЕПОДАВАТЕЛЕЙ:
+- Перечисли всех преподавателей из контекста в формате: ФИО
+- Если указаны предметы — добавь их после ФИО
+- Используй ТОЛЬКО данные из контекста, не добавляй преподавателей "от себя"
+`)
+	}
+
+	if isSpecialtyQuestion(q) {
+		if isGenericSpecialtyListQuestion(q) {
+			b.WriteString(`
+ДОПОЛНИТЕЛЬНО ДЛЯ СПИСКА СПЕЦИАЛЬНОСТЕЙ:
+- Покажи полный список всех специальностей из контекста
+- Указывай полное название и код специальности
+`)
+		} else if containsAny(q, "сравни", "сравнение", "разница", "отличаются") {
+			b.WriteString(`
+ДОПОЛНИТЕЛЬНО ДЛЯ СРАВНЕНИЯ:
+- Сравни только названные специальности по критериям из контекста
+`)
+		} else {
+			b.WriteString(`
+ДОПОЛНИТЕЛЬНО ДЛЯ КОНКРЕТНОЙ СПЕЦИАЛЬНОСТИ:
+- Отвечай только про специальность, которую спросил пользователь
+- Не добавляй информацию про другие специальности
+`)
+		}
+	}
+
+	return b.String()
+}
+
+func predictionLimit(question string) int {
+	q := normalize(question)
+	if isNewsQuestion(q) {
+		return 650
+	}
+	if isTeacherQuestion(q) {
+		return 800 // Увеличен лимит для списка преподавателей
+	}
+	if containsAny(q, "подробно", "сравни", "сравнение", "все", "полный список") {
+		return 700
+	}
+	if isSpecialtyQuestion(q) {
+		return 500
+	}
+	return 350
+}
+
+func askOllama(ctx context.Context, cfg Config, question, contextText string) (string, error) {
+	model, err := pickOllamaModel(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+
+	log.Printf("OLLAMA MODEL: %s", model)
+
+	systemPrompt := buildAnswerInstructions(question)
+	prompt := "ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n" + question +
+		"\n\n=== КОНТЕКСТ С САЙТА КОЛЛЕДЖА ===\n" + contextText +
+		"\n\n=== ТВОЯ ЗАДАЧА ===\nПрочитай контекст и ответь на вопрос. Используй ТОЛЬКО информацию из контекста. Если есть ответ — говори уверенно. Если нет — скажи что не нашел.\n"
+
+	payload := OllamaGenerateRequest{
+		Model:     model,
+		Prompt:    prompt,
+		System:    systemPrompt,
+		Stream:    false,
+		KeepAlive: "10m",
+		Options: map[string]any{
+			"temperature":    0.3,  // Повышено с 0.05 для более естественных ответов
+			"top_p":          0.90,
+			"repeat_penalty": 1.08,
+			"num_ctx":        32768, // Увеличено с 8192 для больших документов
+			"num_predict":    predictionLimit(question),
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	modelCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(
+		modelCtx,
+		http.MethodPost,
+		cfg.OllamaURL+"/api/generate",
+		strings.NewReader(string(body)),
+	)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	started := time.Now()
+	log.Printf("OLLAMA REQUEST: %s model=%s predict=%d", cfg.OllamaURL+"/api/generate", model, predictionLimit(question))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("ошибка подключения к Ollama: %w", err)
+	}
+	defer resp.Body.Close()
+
+	log.Printf("OLLAMA HTTP: %d (%s)", resp.StatusCode, time.Since(started).Round(time.Millisecond))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		return "", fmt.Errorf("Ollama /api/generate HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+
+	var result OllamaGenerateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("ошибка разбора ответа Ollama: %w", err)
+	}
+
+	answer := cleanLLMAnswer(result.Response)
+	if answer == "" {
+		return "", errors.New("Ollama вернула пустой ответ")
+	}
+
+	if result.DoneReason == "length" {
+		log.Printf("OLLAMA: ответ достиг лимита генерации")
+	}
+
+	return ensureCompleteAnswer(answer), nil
+}
+
+// streamOllama выполняет streaming запрос к Ollama
+func streamOllama(ctx context.Context, cfg Config, question, contextText string, onChunk func(string) error) error {
+	model, err := pickOllamaModel(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	systemPrompt := buildAnswerInstructions(question)
+	prompt := "ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n" + question +
+		"\n\n=== КОНТЕКСТ С САЙТА КОЛЛЕДЖА ===\n" + contextText +
+		"\n\n=== ТВОЯ ЗАДАЧА ===\nПрочитай контекст и ответь на вопрос. Используй ТОЛЬКО информацию из контекста. Если есть ответ — говори уверенно. Если нет — скажи что не нашел.\n"
+
+	payload := OllamaGenerateRequest{
+		Model:     model,
+		Prompt:    prompt,
+		System:    systemPrompt,
+		Stream:    true,
+		KeepAlive: "10m",
+		Options: map[string]any{
+			"temperature":    0.3,
+			"top_p":          0.90,
+			"repeat_penalty": 1.08,
+			"num_ctx":        32768,
+			"num_predict":    predictionLimit(question),
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	modelCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(
+		modelCtx,
+		http.MethodPost,
+		cfg.OllamaURL+"/api/generate",
+		strings.NewReader(string(body)),
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	log.Printf("OLLAMA STREAM REQUEST: %s model=%s", cfg.OllamaURL+"/api/generate", model)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ошибка подключения к Ollama: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		return fmt.Errorf("Ollama /api/generate HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var chunk OllamaGenerateResponse
+		if err := json.Unmarshal(line, &chunk); err != nil {
+			log.Printf("OLLAMA STREAM: ошибка разбора: %v", err)
+			continue
+		}
+
+		if chunk.Response != "" {
+			if err := onChunk(chunk.Response); err != nil {
+				return err
+			}
+		}
+
+		if chunk.Done {
+			break
+		}
+	}
+
+	return scanner.Err()
+}
+
+func ensureCompleteAnswer(answer string) string {
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return answer
+	}
+
+	// Если модель оборвала ответ прямо на маркере списка или после двоеточия,
+	// не пытаемся дописывать факты от себя. Просто убираем явный «висящий» маркер.
+	lines := strings.Split(answer, "\n")
+	for len(lines) > 0 {
+		last := strings.TrimSpace(lines[len(lines)-1])
+		if last == "-" || last == "•" || last == "*" || strings.HasSuffix(last, ":") {
+			lines = lines[:len(lines)-1]
+			continue
+		}
+		break
+	}
+
+	answer = strings.TrimSpace(strings.Join(lines, "\n"))
+	return answer
+}
+
+func cleanLLMAnswer(answer string) string {
+	answer = strings.TrimSpace(answer)
+
+	// ---------------------------------------------------------
+	// Убираем служебную обёртку, которую иногда добавляет модель.
+	// Например:
+	// «Вот отредактированный и законченный ответ пользователю... »
+	// ---------------------------------------------------------
+	introPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`(?is)^\s*вот\s+отредактированный\s+и\s+законченный\s+ответ\s+пользователю\s+с\s+учетом\s+предоставленного\s+текста\s*:?\s*`),
+		regexp.MustCompile(`(?is)^\s*вот\s+(?:обновл(?:е|ё)нн(?:ая|ую)|исправленн(?:ая|ую)|готов(?:ая|ый))\s+(?:версия\s+текста|текст|ответ)(?:\s+пользователю)?\s*(?:с\s+исправлением[^:]*|с\s+учетом[^:]*|для\s+пользователя[^:]*)?:?\s*`),
+		regexp.MustCompile(`(?is)^\s*вот\s+готовый\s+ответ\s+пользователю\s*:?\s*`),
+		regexp.MustCompile(`(?is)^\s*вот\s+готовый\s+вариант\s+ответа(?:\s+пользователю)?\s*:?\s*`),
+		regexp.MustCompile(`(?is)^\s*вот\s+обновл(?:е|ё)нн(?:ая|ую)\s+версия[^:]*:?\s*`),
+		regexp.MustCompile(`(?is)^\s*вот\s+исправленн(?:ая|ую)\s+версия[^:]*:?\s*`),
+		regexp.MustCompile(`(?is)^\s*вот\s+ответ\s*:?\s*`),
+	}
+
+	for _, re := range introPatterns {
+		answer = re.ReplaceAllString(answer, "")
+	}
+
+	// Убираем markdown-обёртки и служебные заголовки.
+	answer = regexp.MustCompile(`(?m)^\s*---\s*$`).ReplaceAllString(answer, "")
+	answer = regexp.MustCompile("(?s)```(?:markdown|md|text)?\\s*(.*?)```").ReplaceAllString(answer, "$1")
+
+	lines := strings.Split(answer, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Не показываем markdown-заголовки вроде:
+		// ### Новости
+		// #### Страница 7
+		if regexp.MustCompile(`^#{1,6}\s*`).MatchString(trimmed) {
+			// Не показываем сгенерированные моделью markdown-заголовки:
+			// ### Новости, #### Страница 7 и любые другие heading-строки.
+			continue
+		}
+
+		// Убираем отдельные служебные строки даже без символов #.
+		if strings.EqualFold(trimmed, "новости") ||
+			regexp.MustCompile(`(?i)^страница\s+\d+$`).MatchString(trimmed) {
+			continue
+		}
+
+		filtered = append(filtered, line)
+	}
+
+	answer = strings.Join(filtered, "\n")
+
+	// ---------------------------------------------------------
+	// Убираем источники и URL из пользовательского ответа.
+	// ---------------------------------------------------------
+	urlRE := regexp.MustCompile(`https?://[^\s)]+`)
+	answer = urlRE.ReplaceAllString(answer, "")
+	answer = regexp.MustCompile(`(?im)^\s*источник(?:и)?\s*:?.*$`).ReplaceAllString(answer, "")
+
+	// ---------------------------------------------------------
+	// Убираем markdown-жирность:
+	// **25.06.2025** -> 25.06.2025
+	// **Дизайн** -> Дизайн
+	// ---------------------------------------------------------
+	answer = strings.ReplaceAll(answer, "**", "")
+
+	// Убираем одинокие обратные markdown-кавычки, если модель
+	// случайно использовала их как оформление.
+	answer = strings.ReplaceAll(answer, "`", "")
+
+	lines = strings.Split(answer, "\n")
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		clean = append(clean, line)
+	}
+
+	answer = strings.TrimSpace(strings.Join(clean, "\n"))
+	return answer
+}
+
+// =========================================================
+// FALLBACK WITHOUT OLLAMA
+// =========================================================
+
+func fallbackAnswer(question string, contextText string) string {
+	q := normalize(question)
+	if containsAny(q, "преподавател", "преподает", "преподаёт") {
+		return "Не удалось запустить локальный ИИ для анализа данных преподавателей. Проверь, что Ollama запущена и в ней установлена модель."
+	}
+	if isSpecialtyQuestion(q) {
+		return "Не удалось запустить локальный ИИ для анализа специальностей. Проверь, что Ollama запущена и в ней установлена модель."
+	}
+	if strings.TrimSpace(contextText) == "" {
+		return "Не удалось получить информацию с сайта колледжа."
+	}
+	return "Не удалось сформировать ответ. Проверь, что Ollama запущена и в ней установлена модель."
+}
+
+// =========================================================
+// СПЕЦИАЛЬНОСТИ: ОБЩИЙ СПИСОК
+// =========================================================
+
+func isGenericSpecialtyListQuestion(q string) bool {
+	q = normalize(q)
+
+	return q == "специальности" ||
+		q == "специальность" ||
+		q == "список специальностей" ||
+		q == "какие специальности" ||
+		q == "какие специальности есть" ||
+		q == "какие есть специальности" ||
+		q == "какие направления есть" ||
+		q == "направления" ||
+		q == "список направлений"
+}
+
+func makeSpecialtyListAnswer() string {
+	type specialty struct {
+		Code          string
+		Name          string
+		Qualification string
+	}
+
+	items := []specialty{
+		{Code: "40.02.01", Name: "Право и организация социального обеспечения", Qualification: "Юрист"},
+		{Code: "40.02.04", Name: "Юриспруденция", Qualification: "Юрист"},
+		{Code: "44.02.02", Name: "Преподавание в начальных классах", Qualification: "Учитель начальных классов"},
+		{Code: "54.02.01", Name: "Дизайн", Qualification: "Дизайнер"},
+	}
+
+	var b strings.Builder
+	b.WriteString("В колледже «Номос» представлены следующие специальности:\n\n")
+
+	for i, item := range items {
+		fmt.Fprintf(&b, "%d. %s «%s»\nКвалификация: %s\n\n", i+1, item.Code, item.Name, item.Qualification)
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+// =========================================================
+// ANSWERING
+// =========================================================
+
+func answerQuestion(ctx context.Context, cfg Config, sources []Source, question string) (string, []Source) {
+	started := time.Now()
+
+	q := normalize(question)
+
+	// Общий список специальностей не отправляем в LLM:
+	// он должен всегда содержать все 4 программы.
+	if isGenericSpecialtyListQuestion(q) {
+		log.Printf("SPECIALTY LIST: direct structured answer")
+		return makeSpecialtyListAnswer(), nil
+	}
+
+	// Проверка кэша
+	if globalCacheManager != nil {
+		cacheKey := BuildCacheKey(question, cfg.OllamaModel, nil)
+		cached, err := globalCacheManager.Get(cacheKey)
+		if err != nil {
+			log.Printf("Cache lookup error: %v", err)
+		} else if cached != nil {
+			log.Printf("CACHE HIT: %s (%d hits)", cacheKey.Hash()[:16], cached.HitCount)
+			return cached.Answer, cached.Sources
+		}
+		log.Printf("CACHE MISS: %s", cacheKey.Hash()[:16])
+	}
+
+	if isNewsQuestion(q) {
+		log.Printf("NEWS MODE: весь раздел новостей NOMOS")
+	}
+
+	contextText, usedSources, err := loadContext(ctx, sources, question, cfg.CacheTime)
+	if err != nil {
+		log.Printf("Ошибка получения контекста NOMOS: %v", err)
+		return "Не удалось получить актуальную информацию с сайта колледжа. Проверь подключение к NOMOS.", nil
+	}
+	log.Printf("NOMOS CONTEXT READY: %d chars (%s)", len(contextText), time.Since(started).Round(time.Millisecond))
+
+	answer, err := askOllama(ctx, cfg, question, contextText)
+	if err != nil {
+		log.Printf("Ошибка Ollama: %v", err)
+		return fallbackAnswer(question, contextText), usedSources
+	}
+
+	log.Printf("ANSWER READY: %s", time.Since(started).Round(time.Millisecond))
+	
+	// Сохранение в кэш
+	if globalCacheManager != nil {
+		cacheKey := BuildCacheKey(question, cfg.OllamaModel, nil)
+		if err := globalCacheManager.Put(cacheKey, answer, usedSources, nil); err != nil {
+			log.Printf("Cache save error: %v", err)
+		}
+	}
+	
+	return answer, usedSources
+}
+
+// =========================================================
+// API SERVER
+// =========================================================
+
+type Server struct {
+	Config         Config
+	Sources        []Source
+	SessionManager *SessionManager
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in handleChat: %v", r)
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Internal error: %v", r))
+		}
+	}()
+	
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var request chatRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2*1024*1024)).Decode(&request); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	question := strings.TrimSpace(request.Message)
+	if question == "" {
+		question = strings.TrimSpace(request.Question)
+	}
+	if question == "" {
+		question = strings.TrimSpace(request.Query)
+	}
+	if question == "" {
+		writeJSONError(w, http.StatusBadRequest, "message is empty")
+		return
+	}
+
+	// Получаем или создаем сессию
+	session := s.SessionManager.GetOrCreate(request.SessionID)
+	
+	log.Printf("Вопрос [session=%s]: %s", session.ID[:8], question)
+
+	// Проверяем кэш перед обработкой
+	if globalCacheManager != nil {
+		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
+		cached, err := globalCacheManager.Get(cacheKey)
+		if err == nil && cached != nil {
+			log.Printf("CACHE HIT: %s", cacheKey.Hash()[:16])
+			writeJSON(w, http.StatusOK, chatResponse{
+				Reply:     cached.Answer,
+				Sources:   cached.Sources,
+				SessionID: session.ID,
+			})
+			return
+		}
+		log.Printf("CACHE MISS: %s", cacheKey.Hash()[:16])
+	}
+
+	// Используем новый механизм обработки с контекстом сессии
+	answer, sources, err := GenerateAnswer(r.Context(), s.Config, question, &session.DialogContext)
+	if err != nil {
+		log.Printf("Ошибка генерации ответа: %v", err)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Ошибка: %v", err))
+		return
+	}
+
+	// Обновляем контекст сессии
+	s.SessionManager.UpdateContext(session.ID, session.DialogContext)
+
+	// Сохраняем в кэш
+	if globalCacheManager != nil && err == nil {
+		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
+		if err := globalCacheManager.Put(cacheKey, answer, sources, nil); err != nil {
+			log.Printf("Cache save error: %v", err)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, chatResponse{
+		Reply:     answer,
+		Sources:   sources,
+		SessionID: session.ID,
+	})
+}
+
+func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var request chatRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2*1024*1024)).Decode(&request); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	question := strings.TrimSpace(request.Message)
+	if question == "" {
+		question = strings.TrimSpace(request.Question)
+	}
+	if question == "" {
+		question = strings.TrimSpace(request.Query)
+	}
+	if question == "" {
+		writeJSONError(w, http.StatusBadRequest, "пустой вопрос")
+		return
+	}
+
+	// Получаем или создаем сессию
+	session := s.SessionManager.GetOrCreate(request.SessionID)
+	
+	log.Printf("STREAM [session=%s]: %s", session.ID[:8], question)
+
+	// Настройка SSE
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", s.Config.CORSOrigin)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+
+	// Отправляем session_id клиенту
+	sessionData := map[string]string{"session_id": session.ID}
+	sessionJSON, _ := json.Marshal(sessionData)
+	fmt.Fprintf(w, "event: session\ndata: %s\n\n", string(sessionJSON))
+	flusher.Flush()
+
+	// Проверка кэша
+	if globalCacheManager != nil {
+		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
+		cached, err := globalCacheManager.Get(cacheKey)
+		if err == nil && cached != nil {
+			log.Printf("CACHE HIT (stream): %s", cacheKey.Hash()[:16])
+			fmt.Fprintf(w, "data: %s\n\n", jsonEscape(cached.Answer))
+			flusher.Flush()
+			
+			if len(cached.Sources) > 0 {
+				sourcesJSON, _ := json.Marshal(cached.Sources)
+				fmt.Fprintf(w, "event: sources\ndata: %s\n\n", string(sourcesJSON))
+				flusher.Flush()
+			}
+			
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+		log.Printf("CACHE MISS (stream): %s", cacheKey.Hash()[:16])
+	}
+
+	// Используем новый механизм с streaming и контекстом сессии
+	var collectedAnswer strings.Builder
+	var streamSources []Source
+	
+	err := StreamAnswer(r.Context(), s.Config, question, &session.DialogContext, 
+		func(chunk string) error {
+			collectedAnswer.WriteString(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", jsonEscape(chunk))
+			flusher.Flush()
+			return nil
+		},
+		func(sources []Source) error {
+			streamSources = sources
+			if len(sources) > 0 {
+				sourcesJSON, _ := json.Marshal(sources)
+				fmt.Fprintf(w, "event: sources\ndata: %s\n\n", string(sourcesJSON))
+				flusher.Flush()
+			}
+			return nil
+		},
+	)
+
+	if err != nil {
+		log.Printf("Stream error: %v", err)
+		fmt.Fprintf(w, "data: {\"error\": \"Ошибка генерации ответа\"}\n\n")
+		flusher.Flush()
+		return
+	}
+
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+
+	// Обновляем контекст сессии
+	s.SessionManager.UpdateContext(session.ID, session.DialogContext)
+
+	// Сохраняем в кэш
+	if globalCacheManager != nil {
+		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
+		globalCacheManager.Put(cacheKey, collectedAnswer.String(), streamSources, nil)
+	}
+}
+
+func jsonEscape(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1])
+}
+
+func streamFromOllama(ctx context.Context, cfg Config, question, contextText string, w http.ResponseWriter, flusher http.Flusher) (string, error) {
+	model, err := pickOllamaModel(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+
+	systemPrompt := buildAnswerInstructions(question)
+	prompt := "ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n" + question +
+		"\n\n=== КОНТЕКСТ С САЙТА КОЛЛЕДЖА ===\n" + contextText +
+		"\n\n=== ТВОЯ ЗАДАЧА ===\nПрочитай контекст и ответь на вопрос. Используй ТОЛЬКО информацию из контекста. Если есть ответ — говори уверенно. Если нет — скажи что не нашел.\n"
+
+	payload := OllamaGenerateRequest{
+		Model:     model,
+		Prompt:    prompt,
+		System:    systemPrompt,
+		Stream:    true,
+		KeepAlive: "10m",
+		Options: map[string]any{
+			"temperature":    0.3,
+			"top_p":          0.90,
+			"repeat_penalty": 1.08,
+			"num_ctx":        32768,
+			"num_predict":    predictionLimit(question),
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.OllamaURL+"/api/generate", strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Ollama HTTP %d", resp.StatusCode)
+	}
+
+	var fullAnswer strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var chunk OllamaGenerateResponse
+		if err := json.Unmarshal(line, &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Response != "" {
+			fullAnswer.WriteString(chunk.Response)
+			fmt.Fprintf(w, "data: %s\n\n", jsonEscape(chunk.Response))
+			flusher.Flush()
+		}
+
+		if chunk.Done {
+			break
+		}
+	}
+
+	return fullAnswer.String(), scanner.Err()
+}
+
+// =========================================================
+// STATIC FILES
+// =========================================================
+
+func staticFromRoots(prefix string, roots ...string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relative := strings.TrimPrefix(r.URL.Path, prefix)
+		relative = filepath.Clean(relative)
+		if relative == "." || relative == ".." {
+			relative = "index.html"
+		}
+		if strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+			http.NotFound(w, r)
+			return
+		}
+
+		for _, root := range roots {
+			candidate := filepath.Join(root, relative)
+			info, err := os.Stat(candidate)
+			if err != nil || info.IsDir() {
+				continue
+			}
+
+			http.StripPrefix(prefix, http.FileServer(http.Dir(root))).ServeHTTP(w, r)
+			return
+		}
+
+		http.NotFound(w, r)
+	})
+}
+
+func withCORS(origin string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, errorResponse{Error: message})
+}
+
+// =========================================================
+// MAIN
+// =========================================================
+
+var globalCacheManager *CacheManager
+
+func main() {
+	cfg := loadConfig()
+	sources := buildSources(cfg.NOMOSBase)
+
+	// Инициализация БД и кэша
+	dbPath := filepath.Join("data", "erudit.db")
+	if err := os.MkdirAll("data", 0755); err != nil {
+		log.Fatalf("Failed to create data dir: %v", err)
+	}
+	
+	db, err := InitDatabase(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to init database: %v", err)
+	}
+	defer db.Close()
+	
+	// Вставка начальных источников
+	if err := InsertInitialSources(db, cfg.NOMOSBase); err != nil {
+		log.Fatalf("Failed to insert initial sources: %v", err)
+	}
+	
+	globalCacheManager = NewCacheManager(db)
+	log.Printf("Cache manager initialized")
+
+	// Инициализация менеджера сессий
+	sessionManager := NewSessionManager()
+	log.Printf("Session manager initialized")
+
+	server := &Server{
+		Config:         cfg,
+		Sources:        sources,
+		SessionManager: sessionManager,
+	}
+
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/health", server.handleHealth)
+	mux.HandleFunc("/api/chat", server.handleChat)
+	mux.HandleFunc("/api/chat/stream", server.handleChatStream)
+
+	// Ищем виджет сначала в ./widget, затем в ./web/widget.
+	mux.Handle("/widget/", staticFromRoots("/widget/", "widget", filepath.Join("web", "widget")))
+
+	// Админку оставляем совместимой с обеими структурами проекта.
+	mux.Handle("/admin/", staticFromRoots("/admin/", "admin", filepath.Join("web", "admin")))
+
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	log.Println("========================================")
+	log.Printf("Erudit backend running on :%s", cfg.Port)
+	log.Printf("NOMOS: %s", cfg.NOMOSBase)
+	log.Printf("Ollama: %s", cfg.OllamaURL)
+	if cfg.OllamaModel == "" {
+		log.Println("Ollama model: auto (первая установленная модель)")
+	} else {
+		log.Printf("Ollama model: %s", cfg.OllamaModel)
+	}
+	log.Printf("Widget: http://localhost:%s/widget/chat.html", cfg.Port)
+	log.Printf("Chat API: http://localhost:%s/api/chat", cfg.Port)
+	log.Println("========================================")
+
+	if err := http.ListenAndServe(":"+cfg.Port, withCORS(cfg.CORSOrigin, mux)); err != nil {
+		log.Fatal(err)
+	}
+}
