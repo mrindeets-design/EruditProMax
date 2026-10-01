@@ -18,7 +18,7 @@
 ```bash
 # 1. Установить Ollama (https://ollama.ai)
 # 2. Установить модель
-ollama pull qwen2.5:7b-instruct
+ollama pull llama3.1:8b
 
 # 3. Запустить
 go run .
@@ -47,7 +47,7 @@ curl -X POST http://localhost:3000/api/chat \
 
 ## Требования
 - Go 1.21+
-- Ollama + модель qwen2.5:7b-instruct
+- Ollama + модель llama3.1:8b
 - ~5 GB VRAM
 
 ## Тесты

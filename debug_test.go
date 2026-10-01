@@ -13,7 +13,7 @@ func TestTeachersQuery() {
 	cfg := Config{
 		NOMOSBase:   "https://college-nomos.ru",
 		OllamaURL:   "http://127.0.0.1:11434",
-		OllamaModel: "qwen2.5:7b-instruct",
+		OllamaModel: "llama3.1:8b",
 		CacheTime:   10 * time.Minute,
 	}
 	

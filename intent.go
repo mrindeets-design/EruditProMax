@@ -141,8 +141,8 @@ func detectTopic(q string, context *DialogContext) string {
 		"practice":  {"практик", "стажировк", "производственн", "учебная практика"},
 		"schedule":  {"расписан", "когда занятия", "урок", "пар", "время", "график"},
 		"contacts":  {"контакт", "телефон", "адрес", "email", "почта", "где находится", "как добраться"},
-		"staff":     {"преподава", "учитель", "учителя", "директор", "завуч", "кто ведет", "кто преподает", "педагог", "препод", "предмет", "дисциплин", "богитова", "юлия"},
-		"specialty": {"специальность", "направлен", "профес", "квалификац"},
+		"staff":     {"преподава", "учитель", "учителя", "директор", "руководитель", "завуч", "кто ведет", "кто преподает", "педагог", "препод", "предмет", "дисциплин", "богитова", "юлия"},
+		"specialty": {"специальность", "направлен", "профес", "квалификац", "факультет", "кафедра", "отделение"},
 		"news":      {"новост", "событи", "мероприят", "когда прошло", "что нового"},
 		"documents": {"справк", "аттестат", "диплом", "свидетельств", "документ"},
 		"life":      {"общежит", "столов", "кружок", "секци", "студенческ"},
@@ -261,18 +261,20 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 		// Это уточнение к предыдущему вопросу
 		intent.Type = "clarification"
 		
-		// Восстанавливаем исходный вопрос
-		fullQuestion := context.PendingQuestion
-		
-		// Добавляем уточнение
+		// Восстанавливаем исходный вопрос и добавляем уточнение
 		if context.ExpectedParameter == "specialty" {
 			// Пользователь ответил названием специальности
-			fullQuestion = strings.Replace(fullQuestion, "какой специальности", q, 1)
-			fullQuestion = strings.Replace(fullQuestion, "специальность", q, 1)
-			intent.Question = fullQuestion
+			// Формируем полный вопрос: исходный + уточнение
+			intent.Question = context.PendingQuestion + " по специальности " + q
+			
+			// Извлекаем специальность из ответа пользователя
+			// Используем существующую логику extractEntities
+			extractEntities(q, intent, context)
 		} else if context.ExpectedParameter == "group" {
-			fullQuestion = strings.Replace(fullQuestion, "какой группы", q, 1)
-			intent.Question = fullQuestion
+			intent.Question = context.PendingQuestion + " для группы " + q
+		} else {
+			// Для других параметров просто объединяем
+			intent.Question = context.PendingQuestion + " " + q
 		}
 		
 		// Копируем уже известную информацию

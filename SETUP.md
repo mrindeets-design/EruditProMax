@@ -3,7 +3,7 @@
 ## Установка Ollama и модели
 
 1. Установить Ollama: https://ollama.ai/download
-2. Установить модель: `ollama pull qwen2.5:7b-instruct`
+2. Установить модель: `ollama pull llama3.1:8b`
 3. Проверить: `ollama list`
 
 ## Запуск

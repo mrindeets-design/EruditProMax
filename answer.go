@@ -24,7 +24,8 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 		intent.Type, intent.Topic, intent.Entities, intent.Confidence)
 	
 	// 2. Проверка неоднозначности
-	if intent.IsAmbiguous {
+	// Не спрашиваем уточнение, если это ответ на предыдущее уточнение
+	if intent.IsAmbiguous && intent.Type != "clarification" {
 		clarification := BuildClarificationQuestion(intent)
 		if clarification != "" {
 			// Сохраняем контекст для будущего уточнения
@@ -76,11 +77,12 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	}
 	
 	if len(results) == 0 {
-		return "На предоставленных материалах колледжа я не нашёл информации по этому вопросу. Попробуйте переформулировать вопрос или уточнить детали.", []Source{}, nil
+		return "К сожалению, на сайте колледжа я не нашёл информации по этому вопросу. Уточните, пожалуйста, в приёмной комиссии по телефону +7 (473) 271-35-36.", []Source{}, nil
 	}
 	
 	// 7. Подготовка контекста для модели
-	contextText, sources := buildContextFromResults(results, 5)
+	// УЛУЧШЕНИЕ: увеличиваем количество фрагментов для контекста
+	contextText, sources := buildContextFromResults(results, 8) // было 5
 	log.Printf("CONTEXT: %d символов из %d источников", len(contextText), len(sources))
 	
 	// DEBUG: Логируем первые 500 символов контекста для отладки
@@ -164,9 +166,16 @@ func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContex
 	intent := UnderstandIntent(question, dialogContext)
 	log.Printf("STREAM INTENT: type=%s topic=%s", intent.Type, intent.Topic)
 	
-	if intent.IsAmbiguous {
+	// Не спрашиваем уточнение, если это ответ на предыдущее уточнение
+	if intent.IsAmbiguous && intent.Type != "clarification" {
 		clarification := BuildClarificationQuestion(intent)
 		if clarification != "" {
+			// Сохраняем контекст для будущего уточнения
+			if dialogContext != nil {
+				dialogContext.PendingQuestion = question
+				dialogContext.ExpectedParameter = "specialty"
+				dialogContext.PartialInfo = intent.Entities
+			}
 			return onChunk(clarification)
 		}
 	}
@@ -190,10 +199,10 @@ func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContex
 	}
 	
 	if len(results) == 0 {
-		return onChunk("На предоставленных материалах колледжа я не нашёл информации по этому вопросу. Попробуйте переформулировать вопрос или уточнить детали.")
+		return onChunk("К сожалению, на сайте колледжа я не нашёл информации по этому вопросу. Уточните, пожалуйста, в приёмной комиссии.")
 	}
 	
-	contextText, sources := buildContextFromResults(results, 5)
+	contextText, sources := buildContextFromResults(results, 8) // УЛУЧШЕНИЕ: было 5
 	
 	// Отправляем источники сразу
 	if onSources != nil {

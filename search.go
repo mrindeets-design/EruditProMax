@@ -140,7 +140,8 @@ func selectRelevantSources(cfg Config, query SearchQuery) []Source {
 	
 	for _, src := range allSources {
 		score := calculateSourceScore(src, query)
-		if score > 0 {
+		// УЛУЧШЕНИЕ: берем все источники с score >= 0 для максимального покрытия
+		if score >= 0 {
 			scored = append(scored, scoredSource{src, score})
 		}
 	}
@@ -150,19 +151,19 @@ func selectRelevantSources(cfg Config, query SearchQuery) []Source {
 		return scored[i].score > scored[j].score
 	})
 	
-	// Take top sources, but ensure minimum coverage
+	// УЛУЧШЕНИЕ: увеличиваем количество источников для более широкого поиска
 	relevant := []Source{}
 	for i, s := range scored {
-		// Take top 10 sources, or all with score >= 50
-		if i < 10 || s.score >= 50 {
+		// Берем топ-20 источников, или все с score >= 30 (понижен порог)
+		if i < 20 || s.score >= 30 {
 			relevant = append(relevant, s.source)
 		}
 	}
 	
-	// Always include at least 3 sources for fallback
-	if len(relevant) < 3 && len(allSources) > 0 {
+	// Always include at least 5 sources for fallback (увеличено с 3)
+	if len(relevant) < 5 && len(allSources) > 0 {
 		for _, src := range allSources {
-			if len(relevant) >= 3 {
+			if len(relevant) >= 5 {
 				break
 			}
 			alreadyAdded := false
@@ -509,13 +510,22 @@ func calculateRelevance(query SearchQuery, fragment string) float64 {
 	for _, kw := range keywords {
 		if strings.Contains(fragNorm, kw) {
 			matchedKeywords++
-			score += 0.2
+			// УЛУЧШЕНИЕ: увеличиваем вес ключевых слов
+			score += 0.25 // было 0.2
 		}
 	}
 	
 	// Бонус за полное совпадение всех ключевых слов (например, все 3 слова ФИО)
 	if len(keywords) >= 3 && matchedKeywords == len(keywords) {
 		score += 0.5 // Значительный бонус за точное совпадение
+	}
+	
+	// УЛУЧШЕНИЕ: бонус даже за частичное совпадение ключевых слов
+	if len(keywords) > 0 {
+		kwRatio := float64(matchedKeywords) / float64(len(keywords))
+		if kwRatio >= 0.5 { // хотя бы половина слов совпала
+			score += 0.3 * kwRatio
+		}
 	}
 	
 	for _, entity := range query.Entities {
@@ -540,7 +550,8 @@ func calculateRelevance(query SearchQuery, fragment string) float64 {
 		}
 	}
 	if len(topicKeywords) > 0 {
-		score += 0.3 * float64(matchedTopicKW) / float64(len(topicKeywords))
+		// УЛУЧШЕНИЕ: увеличиваем вес темы
+		score += 0.4 * float64(matchedTopicKW) / float64(len(topicKeywords)) // было 0.3
 	}
 	
 	if query.Topic != "general" {
@@ -686,11 +697,24 @@ func RetrySearch(ctx context.Context, cfg Config, query SearchQuery, attempt int
 func generateAlternativeQueries(query SearchQuery) []SearchQuery {
 	alternatives := []SearchQuery{query}
 	
+	// УЛУЧШЕНИЕ: расширяем словарь синонимов
 	synonyms := map[string][]string{
-		"стоимость": {"цена", "оплата", "сколько стоит"},
-		"поступить": {"зачислиться", "подать документы", "стать студентом"},
-		"где":       {"адрес", "местонахождение", "как найти"},
-		"когда":     {"срок", "дата", "время"},
+		"стоимость":  {"цена", "оплата", "сколько стоит", "платить", "рубл"},
+		"поступить":  {"зачислиться", "подать документы", "стать студентом", "вступить"},
+		"где":        {"адрес", "местонахождение", "как найти", "расположение"},
+		"когда":      {"срок", "дата", "время", "период"},
+		"специальность": {"направление", "профессия", "специализация", "факультет", "кафедра"},
+		"практика":   {"стажировка", "практическая подготовка"},
+		"преподаватель": {"педагог", "учитель", "препод", "преподает"},
+		"расписание": {"график", "занятия", "уроки"},
+		"документ":   {"бумаги", "справки", "аттестат"},
+		"контакт":    {"телефон", "email", "связь", "связаться"},
+		"обучение":   {"учеба", "образование", "учиться"},
+		"колледж":    {"номос", "учебное заведение"},
+		"бюджет":     {"бесплатно", "без оплаты", "бюджетное место"},
+		"форма":      {"очно", "заочно", "дистанционно"},
+		"директор":   {"руководитель", "глава", "директорат", "управление"},
+		"факультет":  {"специальность", "направление", "отделение", "кафедра"},
 	}
 	
 	qNorm := normalize(query.Text)
