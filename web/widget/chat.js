@@ -10,8 +10,13 @@
     const PENDING_KEY =
         "erudit-pending-question";
 
+    const SESSION_KEY =
+        "erudit-session-id";
+
+    // Относительный URL для размещения на одном домене
+    // Можно переопределить через window.ERUDIT_API_URL для раздельного размещения
     const BACKEND_URL =
-        "http://localhost:3000";
+        window.ERUDIT_API_URL || "";
 
 
     // =========================================================
@@ -73,7 +78,8 @@
 
     function addMessage(
         text,
-        type
+        type,
+        sources
     ) {
 
         const message =
@@ -88,6 +94,43 @@
         messages.appendChild(
             message
         );
+
+        // Добавляем источники, если есть
+        if (sources && sources.length > 0) {
+            const sourcesDiv = document.createElement("div");
+            sourcesDiv.className = "message-sources";
+            sourcesDiv.style.marginTop = "8px";
+            sourcesDiv.style.fontSize = "12px";
+            sourcesDiv.style.opacity = "0.8";
+
+            const sourcesTitle = document.createElement("div");
+            sourcesTitle.textContent = "Источники:";
+            sourcesTitle.style.fontWeight = "600";
+            sourcesTitle.style.marginBottom = "4px";
+            sourcesDiv.appendChild(sourcesTitle);
+
+            sources.forEach((source) => {
+                const link = document.createElement("a");
+                link.href = source.url || "#";
+                link.textContent = source.title || source.url || "Источник";
+                link.target = "_blank";
+                link.rel = "noopener noreferrer";
+                link.style.display = "block";
+                link.style.color = "#06468e";
+                link.style.textDecoration = "none";
+                link.style.marginTop = "2px";
+                link.style.wordBreak = "break-word";
+                link.addEventListener("mouseenter", function() {
+                    this.style.textDecoration = "underline";
+                });
+                link.addEventListener("mouseleave", function() {
+                    this.style.textDecoration = "none";
+                });
+                sourcesDiv.appendChild(link);
+            });
+
+            messages.appendChild(sourcesDiv);
+        }
 
         messages.scrollTop =
             messages.scrollHeight;
@@ -162,6 +205,18 @@
             question
         );
 
+        // Получаем сохранённый session_id
+        const sessionId = sessionStorage.getItem(SESSION_KEY);
+
+        const body = {
+            message: question
+        };
+
+        // Добавляем session_id если есть
+        if (sessionId) {
+            body.session_id = sessionId;
+            console.log("📦 Используем session_id:", sessionId);
+        }
 
         const response =
             await fetch(
@@ -174,10 +229,9 @@
                             "application/json"
                     },
 
-                    body: JSON.stringify({
-                        message:
-                        question
-                    })
+                    body: JSON.stringify(
+                        body
+                    )
                 }
             );
 
@@ -204,6 +258,11 @@
         console.log("📥 Ответ backend:", data);
         console.log("📥 JSON backend:", JSON.stringify(data, null, 2));
 
+        // Сохраняем или обновляем session_id
+        if (data.session_id) {
+            sessionStorage.setItem(SESSION_KEY, data.session_id);
+            console.log("💾 Сохранён session_id:", data.session_id);
+        }
 
         if (
             !data ||
@@ -216,7 +275,10 @@
         }
 
 
-        return data.reply;
+        return {
+            reply: data.reply,
+            sources: data.sources || []
+        };
     }
 
 
@@ -242,10 +304,13 @@
 
         showTyping();
 
+        // Блокируем повторную отправку
+        input.disabled = true;
+        form.querySelector("button").disabled = true;
 
         try {
 
-            const reply =
+            const response =
                 await askBackend(
                     question
                 );
@@ -255,8 +320,9 @@
 
 
             addMessage(
-                reply,
-                "bot"
+                response.reply,
+                "bot",
+                response.sources
             );
 
 
@@ -275,6 +341,11 @@
                 "Я получил ваш вопрос, но сейчас не удалось получить ответ от сервера.",
                 "bot"
             );
+        } finally {
+            // Восстанавливаем управление
+            input.disabled = false;
+            form.querySelector("button").disabled = false;
+            input.focus();
         }
     }
 
