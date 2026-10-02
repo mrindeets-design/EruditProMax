@@ -122,6 +122,90 @@ CREATE INDEX idx_fragments_document ON fragments(document_id);
 CREATE INDEX idx_fragments_hash ON fragments(text_hash);
 
 -- =========================================================
+-- FRAGMENTS_FTS (полнотекстовый поиск)
+-- =========================================================
+CREATE VIRTUAL TABLE IF NOT EXISTS fragments_fts USING fts5(
+    text,
+    content='fragments',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+-- Триггеры для автоматической синхронизации FTS5
+CREATE TRIGGER fragments_ai AFTER INSERT ON fragments BEGIN
+    INSERT INTO fragments_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+CREATE TRIGGER fragments_ad AFTER DELETE ON fragments BEGIN
+    INSERT INTO fragments_fts(fragments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+
+CREATE TRIGGER fragments_au AFTER UPDATE ON fragments BEGIN
+    INSERT INTO fragments_fts(fragments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO fragments_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+-- =========================================================
+-- EMBEDDINGS (векторные представления фрагментов)
+-- =========================================================
+CREATE TABLE embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fragment_id INTEGER NOT NULL,
+    model_name TEXT NOT NULL,
+    model_dimension INTEGER NOT NULL,
+    embedding_blob BLOB NOT NULL,
+    content_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (fragment_id) REFERENCES fragments(id) ON DELETE CASCADE,
+    UNIQUE (fragment_id, model_name)
+);
+
+CREATE INDEX idx_embeddings_fragment ON embeddings(fragment_id);
+CREATE INDEX idx_embeddings_model ON embeddings(model_name, content_version);
+
+-- =========================================================
+-- FRAGMENTS_FTS (полнотекстовый поиск)
+-- =========================================================
+CREATE VIRTUAL TABLE IF NOT EXISTS fragments_fts USING fts5(
+    text,
+    content='fragments',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+-- Триггеры для автоматической синхронизации FTS5
+CREATE TRIGGER fragments_ai AFTER INSERT ON fragments BEGIN
+    INSERT INTO fragments_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+CREATE TRIGGER fragments_ad AFTER DELETE ON fragments BEGIN
+    INSERT INTO fragments_fts(fragments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+
+CREATE TRIGGER fragments_au AFTER UPDATE ON fragments BEGIN
+    INSERT INTO fragments_fts(fragments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO fragments_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+-- =========================================================
+-- EMBEDDINGS (векторные представления фрагментов)
+-- =========================================================
+CREATE TABLE embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fragment_id INTEGER NOT NULL,
+    model_name TEXT NOT NULL,
+    model_dimension INTEGER NOT NULL,
+    embedding_blob BLOB NOT NULL,
+    content_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (fragment_id) REFERENCES fragments(id) ON DELETE CASCADE,
+    UNIQUE (fragment_id, model_name)
+);
+
+CREATE INDEX idx_embeddings_fragment ON embeddings(fragment_id);
+CREATE INDEX idx_embeddings_model ON embeddings(model_name, content_version);
+
+-- =========================================================
 -- CACHE_KEYS (нормализованные вопросы с контекстом)
 -- =========================================================
 CREATE TABLE cache_keys (
@@ -221,3 +305,68 @@ CREATE TABLE stats (
 CREATE INDEX idx_stats_time ON stats(timestamp DESC);
 CREATE INDEX idx_stats_name ON stats(metric_name, timestamp DESC);
 `
+
+
+const migrationV2 = `
+-- =========================================================
+-- Migration V2: FTS5 и embeddings для гибридного поиска
+-- =========================================================
+
+-- Полнотекстовый поиск с FTS5
+CREATE VIRTUAL TABLE IF NOT EXISTS fragments_fts USING fts5(
+    text,
+    content='fragments',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+-- Заполняем FTS5 существующими данными
+INSERT INTO fragments_fts(rowid, text) 
+SELECT id, text FROM fragments;
+
+-- Триггеры для автоматической синхронизации
+CREATE TRIGGER fragments_ai AFTER INSERT ON fragments BEGIN
+    INSERT INTO fragments_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+CREATE TRIGGER fragments_ad AFTER DELETE ON fragments BEGIN
+    INSERT INTO fragments_fts(fragments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+
+CREATE TRIGGER fragments_au AFTER UPDATE ON fragments BEGIN
+    INSERT INTO fragments_fts(fragments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO fragments_fts(rowid, text) VALUES (new.id, new.text);
+END;
+
+-- Таблица эмбеддингов
+CREATE TABLE embeddings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fragment_id INTEGER NOT NULL,
+    model_name TEXT NOT NULL,
+    model_dimension INTEGER NOT NULL,
+    embedding_blob BLOB NOT NULL,
+    content_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (fragment_id) REFERENCES fragments(id) ON DELETE CASCADE,
+    UNIQUE (fragment_id, model_name)
+);
+
+CREATE INDEX idx_embeddings_fragment ON embeddings(fragment_id);
+CREATE INDEX idx_embeddings_model ON embeddings(model_name, content_version);
+
+-- Таблица конфигурации поиска
+CREATE TABLE search_config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Начальные настройки
+INSERT INTO search_config (key, value) VALUES 
+    ('embedding_model', ''),
+    ('embedding_dimension', '0'),
+    ('lexical_weight', '0.4'),
+    ('semantic_weight', '0.6'),
+    ('min_score_threshold', '0.3');
+`
+

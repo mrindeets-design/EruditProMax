@@ -13,34 +13,35 @@ import (
 // DATABASE SCHEMA & MIGRATIONS
 // =========================================================
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // InitDatabase создаёт или мигрирует схему БД
 func InitDatabase(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	// Формируем DSN с параметрами для modernc.org/sqlite
+	// Эти параметры применяются к каждому соединению в пуле
+	dsn := dbPath + "?_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	// Настройки SQLite для многопоточности и производительности
-	// Устанавливаем busy_timeout сразу после открытия
-	if _, err := db.Exec("PRAGMA busy_timeout=10000"); err != nil {
+	// Настройки пула соединений для SQLite
+	// SQLite работает лучше с ограниченным количеством writer-соединений
+	db.SetMaxOpenConns(10)  // Разрешаем несколько читателей
+	db.SetMaxIdleConns(5)   // Держим несколько соединений в пуле
+	db.SetConnMaxLifetime(0) // Переиспользуем соединения
+
+	// Проверяем, что настройки применились
+	if err := verifyPragmas(db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("busy_timeout: %w", err)
+		return nil, fmt.Errorf("pragma verification failed: %w", err)
 	}
 
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA cache_size=-64000", // 64MB
-		"PRAGMA foreign_keys=ON",
-	}
-
-	for _, pragma := range pragmas {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("pragma: %w", err)
-		}
+	// Дополнительные настройки производительности
+	if _, err := db.Exec("PRAGMA cache_size=-64000"); err != nil { // 64MB
+		db.Close()
+		return nil, fmt.Errorf("cache_size: %w", err)
 	}
 
 	currentVersion, err := getSchemaVersion(db)
@@ -59,6 +60,35 @@ func InitDatabase(dbPath string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+// verifyPragmas проверяет, что критические настройки применены
+func verifyPragmas(db *sql.DB) error {
+	var foreignKeys int
+	if err := db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("check foreign_keys: %w", err)
+	}
+	if foreignKeys != 1 {
+		return fmt.Errorf("foreign_keys not enabled: got %d, want 1", foreignKeys)
+	}
+
+	var busyTimeout int
+	if err := db.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		return fmt.Errorf("check busy_timeout: %w", err)
+	}
+	if busyTimeout < 5000 {
+		log.Printf("⚠️  Warning: busy_timeout is %d ms (expected >= 10000 ms)", busyTimeout)
+	}
+
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		return fmt.Errorf("check journal_mode: %w", err)
+	}
+	
+	log.Printf("✅ SQLite configured: foreign_keys=%d, busy_timeout=%d ms, journal_mode=%s", 
+		foreignKeys, busyTimeout, journalMode)
+
+	return nil
 }
 
 func getSchemaVersion(db *sql.DB) (int, error) {
@@ -92,6 +122,7 @@ func runMigrations(db *sql.DB, fromVersion int) error {
 		sql     string
 	}{
 		{1, "initial_schema", migrationV1Part1 + migrationV1Part2 + migrationV1Part3},
+		{2, "add_fts5_and_embeddings", migrationV2},
 	}
 
 	for _, m := range migrations {

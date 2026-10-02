@@ -12,13 +12,19 @@ import (
 // ANSWER GENERATION
 // =========================================================
 
-// GenerateAnswer формирует ответ на вопрос
-// Логика работы: 1) Понимание контекста → 2) Поиск информации → 3) Генерация ответа
-func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogContext *DialogContext) (string, []Source, error) {
-	startTime := time.Now()
-	
-	log.Printf("GenerateAnswer: START")
-	
+// answerContext содержит результат подготовки контекста для ответа
+type answerContext struct {
+	Intent        Intent
+	ContextText   string
+	Sources       []Source
+	FragmentIDs   []int64 // ID использованных фрагментов для кеша
+	DirectReply   string  // Для приветствий и уточнений
+	ShouldGenerate bool   // false если есть DirectReply
+}
+
+// prepareAnswerContext выполняет общую логику подготовки: понимание намерения, поиск материалов
+// Возвращает либо готовый ответ (уточнение/приветствие), либо контекст для генерации
+func prepareAnswerContext(ctx context.Context, cfg Config, question string, dialogContext *DialogContext) (*answerContext, error) {
 	// ШАГ 1: Понимание контекста вопроса
 	intent := UnderstandIntent(question, dialogContext)
 	log.Printf("INTENT: type=%s topic=%s entities=%v confidence=%.2f", 
@@ -45,16 +51,22 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 				dialogContext.PartialInfo["topic"] = intent.Topic
 				log.Printf("ASKING CLARIFICATION: topic='%s' entities=%v", intent.Topic, intent.Entities)
 			}
-			return clarification, []Source{}, nil
+			return &answerContext{
+				Intent:         intent,
+				DirectReply:    clarification,
+				ShouldGenerate: false,
+			}, nil
 		}
 	}
 	
 	// 3. Обработка приветствий
 	if intent.Type == "greeting" {
-		return "Здравствуйте! Я Эрудит — помощник Воронежского колледжа «Номос». Могу рассказать о поступлении, специальностях, стоимости обучения, преподавателях и других вопросах. Чем могу помочь?", []Source{}, nil
+		return &answerContext{
+			Intent:         intent,
+			DirectReply:    "Здравствуйте! Я Эрудит — помощник Воронежского колледжа «Номос». Могу рассказать о поступлении, специальностях, стоимости обучения, преподавателях и других вопросах. Чем могу помочь?",
+			ShouldGenerate: false,
+		}, nil
 	}
-	
-	log.Printf("GenerateAnswer: Before PrepareSearchQuery")
 	
 	// ШАГ 2: Поиск информации
 	// 2.1 Подготовка поисковых запросов
@@ -63,10 +75,10 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	
 	log.Printf("GenerateAnswer: Before SearchMaterials")
 	
-	// 2.2 Поиск материалов в базе данных
-	results, err := SearchMaterialsWithContext(ctx, cfg, queries, dialogContext)
+	// 2.2 Поиск материалов в базе данных (используем гибридный поиск если доступен)
+	results, err := SearchMaterialsWithHybridEngine(ctx, globalDB, cfg, queries, dialogContext)
 	if err != nil {
-		return "", nil, fmt.Errorf("ошибка поиска: %w", err)
+		return nil, fmt.Errorf("ошибка поиска: %w", err)
 	}
 	
 	log.Printf("SEARCH RESULTS: найдено %d фрагментов", len(results))
@@ -89,14 +101,16 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	}
 	
 	if len(results) == 0 {
-		return "К сожалению, на сайте колледжа я не нашёл информации по этому вопросу. Уточните, пожалуйста, в приёмной комиссии по телефону +7 (473) 271-35-36.", []Source{}, nil
+		return &answerContext{
+			Intent:         intent,
+			DirectReply:    "К сожалению, на сайте колледжа я не нашёл информации по этому вопросу. Уточните, пожалуйста, в приёмной комиссии по телефону +7 (473) 271-35-36.",
+			ShouldGenerate: false,
+		}, nil
 	}
 	
-	// ШАГ 3: Генерация ответа
-	// 3.1 Подготовка контекста для модели
-	// УЛУЧШЕНИЕ: увеличиваем количество фрагментов для контекста
-	contextText, sources := buildContextFromResults(results, 8) // было 5
-	log.Printf("CONTEXT: %d символов из %d источников", len(contextText), len(sources))
+	// ШАГ 3: Подготовка контекста для модели
+	contextText, sources, fragmentIDs := buildContextFromResults(results, 8) // было 5
+	log.Printf("CONTEXT: %d символов из %d источников, %d фрагментов", len(contextText), len(sources), len(fragmentIDs))
 	
 	// DEBUG: Логируем первые 500 символов контекста для отладки
 	if len(contextText) > 0 {
@@ -107,65 +121,111 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 		log.Printf("CONTEXT PREVIEW: %s...", preview)
 	}
 	
-	// 8. Генерация ответа через Ollama
-	answer, err := askOllama(ctx, cfg, question, contextText, dialogContext)
-	if err != nil {
-		return "", nil, fmt.Errorf("ошибка Ollama: %w", err)
+	return &answerContext{
+		Intent:         intent,
+		ContextText:    contextText,
+		Sources:        sources,
+		FragmentIDs:    fragmentIDs,
+		ShouldGenerate: true,
+	}, nil
+}
+
+// finalizeDialogTurn обновляет состояние диалога после получения ответа
+// Вызывается ТОЛЬКО для успешно завершенных ходов
+func finalizeDialogTurn(question, answer string, intent Intent, sources []Source, dialogContext *DialogContext) {
+	if dialogContext == nil {
+		return
 	}
 	
-	// 9. Обновление контекста диалога
-	if dialogContext != nil {
-		dialogContext.CurrentTopic = intent.Topic
-		
-		// Инициализируем LastEntities, если он nil
-		if dialogContext.LastEntities == nil {
-			dialogContext.LastEntities = make(map[string]string)
-		}
-		
-		log.Printf("CONTEXT UPDATE: Before update - LastEntities=%v, intent.Entities=%v", dialogContext.LastEntities, intent.Entities)
-		
-		// Объединяем сущности: сохраняем старые, если новые не переопределили их
-		if len(intent.Entities) > 0 {
-			// Если есть новые сущности, обновляем только их
-			for k, v := range intent.Entities {
-				dialogContext.LastEntities[k] = v
-			}
-		}
-		// Если сущностей нет вообще, не трогаем LastEntities (сохраняем контекст)
-		
-		log.Printf("CONTEXT UPDATE: After update - LastEntities=%v", dialogContext.LastEntities)
-		
-		dialogContext.LastSources = sources
-		
-		turn := DialogTurn{
-			UserMessage: question,
-			BotReply:    answer,
-			Intent:      intent,
-			Sources:     sources,
-			Timestamp:   time.Now().Format(time.RFC3339),
-		}
-		dialogContext.History = append(dialogContext.History, turn)
-		
-		// Ограничиваем историю последними 5 шагами
-		if len(dialogContext.History) > 5 {
-			dialogContext.History = dialogContext.History[len(dialogContext.History)-5:]
+	// Обновляем контекст диалога
+	dialogContext.CurrentTopic = intent.Topic
+	
+	// Инициализируем LastEntities, если он nil
+	if dialogContext.LastEntities == nil {
+		dialogContext.LastEntities = make(map[string]string)
+	}
+	
+	log.Printf("CONTEXT UPDATE: Before update - LastEntities=%v, intent.Entities=%v", dialogContext.LastEntities, intent.Entities)
+	
+	// Объединяем сущности: сохраняем старые, если новые не переопределили их
+	if len(intent.Entities) > 0 {
+		// Если есть новые сущности, обновляем только их
+		for k, v := range intent.Entities {
+			dialogContext.LastEntities[k] = v
 		}
 	}
+	// Если сущностей нет вообще, не трогаем LastEntities (сохраняем контекст)
+	
+	log.Printf("CONTEXT UPDATE: After update - LastEntities=%v", dialogContext.LastEntities)
+	
+	dialogContext.LastSources = sources
+	
+	turn := DialogTurn{
+		UserMessage: question,
+		BotReply:    answer,
+		Intent:      intent,
+		Sources:     sources,
+		Timestamp:   time.Now().Format(time.RFC3339),
+	}
+	dialogContext.History = append(dialogContext.History, turn)
+	
+	// Ограничиваем историю последними 5 шагами
+	if len(dialogContext.History) > 5 {
+		dialogContext.History = dialogContext.History[len(dialogContext.History)-5:]
+	}
+	
+	log.Printf("DIALOG: turn added, history size=%d, topic=%s", len(dialogContext.History), intent.Topic)
+}
+
+// GenerateAnswer формирует ответ на вопрос (без streaming)
+func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogContext *DialogContext) (string, []Source, []int64, error) {
+	startTime := time.Now()
+	log.Printf("GenerateAnswer: START")
+	
+	// Подготовка контекста
+	ansCtx, err := prepareAnswerContext(ctx, cfg, question, dialogContext)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	
+	// Если есть готовый ответ (приветствие/уточнение/не найдено)
+	if !ansCtx.ShouldGenerate {
+		// Для приветствий и "не найдено" тоже записываем в историю
+		if ansCtx.Intent.Type == "greeting" || strings.Contains(ansCtx.DirectReply, "не нашёл") {
+			finalizeDialogTurn(question, ansCtx.DirectReply, ansCtx.Intent, ansCtx.Sources, dialogContext)
+		}
+		// Для уточнений НЕ записываем - ждем полного ответа
+		elapsed := time.Since(startTime)
+		log.Printf("DIRECT REPLY: %v", elapsed)
+		return ansCtx.DirectReply, ansCtx.Sources, nil, nil
+	}
+	
+	// Генерация ответа через Ollama
+	log.Printf("GenerateAnswer: Before AskOllama")
+	answer, err := askOllama(ctx, cfg, question, ansCtx.ContextText, dialogContext)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("ошибка Ollama: %w", err)
+	}
+	log.Printf("GenerateAnswer: After AskOllama, answer length: %d", len(answer))
+	
+	// Обновляем историю диалога
+	finalizeDialogTurn(question, answer, ansCtx.Intent, ansCtx.Sources, dialogContext)
 	
 	elapsed := time.Since(startTime)
 	log.Printf("ANSWER READY: %v", elapsed)
 	
-	return answer, sources, nil
+	return answer, ansCtx.Sources, ansCtx.FragmentIDs, nil
 }
 
 // buildContextFromResults собирает контекст из результатов поиска
-func buildContextFromResults(results []SearchResult, maxFragments int) (string, []Source) {
+func buildContextFromResults(results []SearchResult, maxFragments int) (string, []Source, []int64) {
 	if len(results) > maxFragments {
 		results = results[:maxFragments]
 	}
 	
 	var sb strings.Builder
 	sourcesMap := make(map[string]Source)
+	var fragmentIDs []int64
 	
 	for i, result := range results {
 		sb.WriteString(fmt.Sprintf("\n=== Фрагмент %d (релевантность: %.2f) ===\n", i+1, result.Relevance))
@@ -178,6 +238,11 @@ func buildContextFromResults(results []SearchResult, maxFragments int) (string, 
 		
 		// Собираем уникальные источники
 		sourcesMap[result.Source.URL] = result.Source
+		
+		// Собираем ID фрагментов для кеша
+		if result.FragmentID > 0 {
+			fragmentIDs = append(fragmentIDs, result.FragmentID)
+		}
 	}
 	
 	// Преобразуем map в slice
@@ -186,71 +251,76 @@ func buildContextFromResults(results []SearchResult, maxFragments int) (string, 
 		sources = append(sources, src)
 	}
 	
-	return sb.String(), sources
+	return sb.String(), sources, fragmentIDs
 }
 
 // StreamAnswer генерирует ответ с поддержкой streaming
-func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContext *DialogContext, onChunk func(string) error, onSources func([]Source) error) error {
-	// Используем тот же процесс, но с streaming от Ollama
+func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContext *DialogContext, onChunk func(string) error, onSources func([]Source) error, onFragmentIDs func([]int64) error) error {
 	startTime := time.Now()
+	log.Printf("StreamAnswer: START")
 	
-	intent := UnderstandIntent(question, dialogContext)
-	log.Printf("STREAM INTENT: type=%s topic=%s", intent.Type, intent.Topic)
-	
-	// Не спрашиваем уточнение, если это ответ на предыдущее уточнение
-	if intent.IsAmbiguous && intent.Type != "clarification" {
-		clarification := BuildClarificationQuestion(intent, dialogContext)
-		if clarification != "" {
-			// Сохраняем контекст для будущего уточнения
-			if dialogContext != nil {
-				dialogContext.PendingQuestion = question
-				dialogContext.ExpectedParameter = "specialty"
-				dialogContext.PartialInfo = intent.Entities
-			}
-			return onChunk(clarification)
-		}
-	}
-	
-	if intent.Type == "greeting" {
-		return onChunk("Здравствуйте! Я Эрудит — помощник Воронежского колледжа «Номос». Могу рассказать о поступлении, специальностях, стоимости обучения, преподавателях и других вопросах. Чем могу помочь?")
-	}
-	
-	queries := PrepareSearchQuery(intent)
-	results, err := SearchMaterialsWithContext(ctx, cfg, queries, dialogContext)
+	// Подготовка контекста (та же логика, что и в GenerateAnswer)
+	ansCtx, err := prepareAnswerContext(ctx, cfg, question, dialogContext)
 	if err != nil {
 		return err
 	}
 	
-	if len(queries) > 0 && !CheckSufficiency(queries[0], results) && len(results) < 3 {
-		retryResults, _ := RetrySearchWithContext(ctx, cfg, queries[0], 1, dialogContext)
-		if len(retryResults) > 0 {
-			results = append(results, retryResults...)
-			results = deduplicateResults(results)
+	// Если есть готовый ответ (приветствие/уточнение/не найдено)
+	if !ansCtx.ShouldGenerate {
+		// Отправляем готовый ответ через onChunk
+		if err := onChunk(ansCtx.DirectReply); err != nil {
+			return err
+		}
+		
+		// Для приветствий и "не найдено" записываем в историю
+		if ansCtx.Intent.Type == "greeting" || strings.Contains(ansCtx.DirectReply, "не нашёл") {
+			finalizeDialogTurn(question, ansCtx.DirectReply, ansCtx.Intent, ansCtx.Sources, dialogContext)
+		}
+		// Для уточнений НЕ записываем - ждем полного ответа
+		
+		elapsed := time.Since(startTime)
+		log.Printf("STREAM DIRECT REPLY: %v", elapsed)
+		return nil
+	}
+	
+	// Отправляем источники сразу после подготовки контекста
+	if onSources != nil && len(ansCtx.Sources) > 0 {
+		if err := onSources(ansCtx.Sources); err != nil {
+			return err
 		}
 	}
 	
-	if len(results) == 0 {
-		return onChunk("К сожалению, на сайте колледжа я не нашёл информации по этому вопросу. Уточните, пожалуйста, в приёмной комиссии.")
+	// Отправляем fragmentIDs для кеширования
+	if onFragmentIDs != nil && len(ansCtx.FragmentIDs) > 0 {
+		if err := onFragmentIDs(ansCtx.FragmentIDs); err != nil {
+			return err
+		}
 	}
 	
-	contextText, sources := buildContextFromResults(results, 8) // УЛУЧШЕНИЕ: было 5
-	
-	// Отправляем источники сразу
-	if onSources != nil {
-		onSources(sources)
+	// Собираем ответ для записи в историю
+	var collectedAnswer strings.Builder
+	wrappedOnChunk := func(chunk string) error {
+		collectedAnswer.WriteString(chunk)
+		return onChunk(chunk)
 	}
 	
 	// Streaming запрос к Ollama
-	err = streamOllama(ctx, cfg, question, contextText, dialogContext, onChunk)
+	log.Printf("StreamAnswer: Before streamOllama")
+	err = streamOllama(ctx, cfg, question, ansCtx.ContextText, dialogContext, wrappedOnChunk)
+	if err != nil {
+		log.Printf("StreamAnswer: streamOllama error: %v", err)
+		return err
+	}
 	
-	if dialogContext != nil {
-		dialogContext.CurrentTopic = intent.Topic
-		dialogContext.LastEntities = intent.Entities
-		dialogContext.LastSources = sources
+	// ВАЖНО: обновляем историю ТОЛЬКО после успешного завершения потока
+	answer := collectedAnswer.String()
+	if answer != "" {
+		finalizeDialogTurn(question, answer, ansCtx.Intent, ansCtx.Sources, dialogContext)
 	}
 	
 	elapsed := time.Since(startTime)
 	log.Printf("STREAM COMPLETE: %v", elapsed)
 	
-	return err
+	return nil
 }
+

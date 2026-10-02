@@ -85,24 +85,27 @@ func TestSessionManager(t *testing.T) {
 	sm := NewSessionManager()
 	
 	// Создаем новую сессию
-	session1 := sm.GetOrCreate("")
-	if session1.ID == "" {
+	sid1, ctx1 := sm.GetOrCreate("")
+	if sid1 == "" {
 		t.Error("Session ID should not be empty")
 	}
 	
 	// Получаем ту же сессию
-	session2 := sm.GetOrCreate(session1.ID)
-	if session2.ID != session1.ID {
+	sid2, _ := sm.GetOrCreate(sid1)
+	if sid2 != sid1 {
 		t.Error("Should return the same session")
 	}
 	
 	// Обновляем контекст
-	session1.DialogContext.CurrentTopic = "admission"
-	sm.UpdateContext(session1.ID, session1.DialogContext)
+	ctx1.CurrentTopic = "admission"
+	sm.UpdateContext(sid1, ctx1)
 	
 	// Проверяем, что контекст обновился
-	session3 := sm.GetOrCreate(session1.ID)
-	if session3.DialogContext.CurrentTopic != "admission" {
+	sid3, ctx3 := sm.GetOrCreate(sid1)
+	if sid3 != sid1 {
+		t.Error("Session ID should not change")
+	}
+	if ctx3.CurrentTopic != "admission" {
 		t.Error("Context should be updated")
 	}
 }
@@ -162,7 +165,7 @@ func TestParsePriceList(t *testing.T) {
 }
 
 func TestCrawlerPageKindDetection(t *testing.T) {
-	crawler := NewCrawler(nil, "https://college-nomos.ru")
+	crawler := NewCrawler(nil, "https://college-nomos.ru", CrawlerConfig{})
 	
 	tests := []struct {
 		url  string

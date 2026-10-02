@@ -3,6 +3,7 @@
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1983,7 +1984,8 @@ func answerQuestion(ctx context.Context, cfg Config, sources []Source, question 
 
 	// Проверка кэша
 	if globalCacheManager != nil {
-		cacheKey := BuildCacheKey(question, cfg.OllamaModel, nil)
+		indexVersion := GetIndexVersion(globalDB)
+		cacheKey := BuildCacheKey(question, cfg.OllamaModel, nil, nil, indexVersion)
 		cached, err := globalCacheManager.Get(cacheKey)
 		if err != nil {
 			log.Printf("Cache lookup error: %v", err)
@@ -2015,7 +2017,8 @@ func answerQuestion(ctx context.Context, cfg Config, sources []Source, question 
 	
 	// Сохранение в кэш
 	if globalCacheManager != nil {
-		cacheKey := BuildCacheKey(question, cfg.OllamaModel, nil)
+		indexVersion := GetIndexVersion(globalDB)
+		cacheKey := BuildCacheKey(question, cfg.OllamaModel, nil, nil, indexVersion)
 		if err := globalCacheManager.Put(cacheKey, answer, usedSources, nil); err != nil {
 			log.Printf("Cache save error: %v", err)
 		}
@@ -2070,41 +2073,52 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Получаем или создаем сессию
-	session := s.SessionManager.GetOrCreate(request.SessionID)
+	sessionID, dialogContext := s.SessionManager.GetOrCreate(request.SessionID)
 	
-	log.Printf("Вопрос [session=%s]: %s", session.ID[:8], question)
+	log.Printf("Вопрос [session=%s]: %s", sessionID, question)
 
-	// Проверяем кэш перед обработкой
+	// Создаём ключ кэша ОДИН РАЗ до любых изменений контекста
+	var cacheKey CacheKey
 	if globalCacheManager != nil {
-		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
+		indexVersion := GetIndexVersion(globalDB)
+		cacheKey = BuildCacheKey(question, s.Config.OllamaModel, dialogContext.ToContextStrings(), dialogContext.LastEntities, indexVersion)
+		
+		// Проверяем кэш перед обработкой
 		cached, err := globalCacheManager.Get(cacheKey)
 		if err == nil && cached != nil {
-			log.Printf("CACHE HIT: %s", cacheKey.Hash()[:16])
+			log.Printf("CACHE HIT: %s (hit %d, fragments: %v)", cacheKey.Hash()[:16], cached.HitCount, cached.FragmentIDs)
+			
+			// При cache hit обновляем ТОЛЬКО текущую сессию, не переносим чужую историю
+			// Важно: не вызываем finalizeDialogTurn, т.к. это вызовет дублирование в истории
+			// Просто возвращаем закешированный ответ
 			writeJSON(w, http.StatusOK, chatResponse{
 				Reply:     cached.Answer,
 				Sources:   cached.Sources,
-				SessionID: session.ID,
+				SessionID: sessionID,
 			})
 			return
 		}
-		log.Printf("CACHE MISS: %s", cacheKey.Hash()[:16])
+		if err != nil {
+			log.Printf("Cache lookup error: %v", err)
+		} else {
+			log.Printf("CACHE MISS: %s", cacheKey.Hash()[:16])
+		}
 	}
 
 	// Используем новый механизм обработки с контекстом сессии
-	answer, sources, err := GenerateAnswer(r.Context(), s.Config, question, &session.DialogContext)
+	answer, sources, fragmentIDs, err := GenerateAnswer(r.Context(), s.Config, question, &dialogContext)
 	if err != nil {
 		log.Printf("Ошибка генерации ответа: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Ошибка: %v", err))
 		return
 	}
 
-	// Обновляем контекст сессии (передаём указатель, который уже был модифицирован)
-	s.SessionManager.UpdateContext(session.ID, session.DialogContext)
+	// Обновляем контекст сессии ПОСЛЕ успешной генерации
+	s.SessionManager.UpdateContext(sessionID, dialogContext)
 
-	// Сохраняем в кэш
-	if globalCacheManager != nil && err == nil {
-		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
-		if err := globalCacheManager.Put(cacheKey, answer, sources, nil); err != nil {
+	// Сохраняем в кэш ТОЛЬКО успешные ответы с fragmentIDs
+	if globalCacheManager != nil && err == nil && len(fragmentIDs) > 0 {
+		if err := globalCacheManager.Put(cacheKey, answer, sources, fragmentIDs); err != nil {
 			log.Printf("Cache save error: %v", err)
 		}
 	}
@@ -2112,7 +2126,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, chatResponse{
 		Reply:     answer,
 		Sources:   sources,
-		SessionID: session.ID,
+		SessionID: sessionID,
 	})
 }
 
@@ -2141,9 +2155,9 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Получаем или создаем сессию
-	session := s.SessionManager.GetOrCreate(request.SessionID)
+	sessionID, dialogContext := s.SessionManager.GetOrCreate(request.SessionID)
 	
-	log.Printf("STREAM [session=%s]: %s", session.ID[:8], question)
+	log.Printf("STREAM [session=%s]: %s", sessionID, question)
 
 	// Настройка SSE
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -2158,17 +2172,21 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Отправляем session_id клиенту
-	sessionData := map[string]string{"session_id": session.ID}
+	sessionData := map[string]string{"session_id": sessionID}
 	sessionJSON, _ := json.Marshal(sessionData)
 	fmt.Fprintf(w, "event: session\ndata: %s\n\n", string(sessionJSON))
 	flusher.Flush()
 
-	// Проверка кэша
+	// Создаём ключ кэша ОДИН РАЗ до любых изменений контекста
+	var cacheKey CacheKey
 	if globalCacheManager != nil {
-		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
+		indexVersion := GetIndexVersion(globalDB)
+		cacheKey = BuildCacheKey(question, s.Config.OllamaModel, dialogContext.ToContextStrings(), dialogContext.LastEntities, indexVersion)
+		
+		// Проверка кэша
 		cached, err := globalCacheManager.Get(cacheKey)
 		if err == nil && cached != nil {
-			log.Printf("CACHE HIT (stream): %s", cacheKey.Hash()[:16])
+			log.Printf("CACHE HIT (stream): %s (hit %d)", cacheKey.Hash()[:16], cached.HitCount)
 			fmt.Fprintf(w, "data: %s\n\n", jsonEscape(cached.Answer))
 			flusher.Flush()
 			
@@ -2182,14 +2200,20 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return
 		}
-		log.Printf("CACHE MISS (stream): %s", cacheKey.Hash()[:16])
+		if err != nil {
+			log.Printf("Cache lookup error: %v", err)
+		} else {
+			log.Printf("CACHE MISS (stream): %s", cacheKey.Hash()[:16])
+		}
 	}
 
 	// Используем новый механизм с streaming и контекстом сессии
 	var collectedAnswer strings.Builder
 	var streamSources []Source
+	var streamFragmentIDs []int64
+	var streamError error
 	
-	err := StreamAnswer(r.Context(), s.Config, question, &session.DialogContext, 
+	streamError = StreamAnswer(r.Context(), s.Config, question, &dialogContext, 
 		func(chunk string) error {
 			collectedAnswer.WriteString(chunk)
 			fmt.Fprintf(w, "data: %s\n\n", jsonEscape(chunk))
@@ -2205,10 +2229,14 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		},
+		func(fragmentIDs []int64) error {
+			streamFragmentIDs = fragmentIDs
+			return nil
+		},
 	)
 
-	if err != nil {
-		log.Printf("Stream error: %v", err)
+	if streamError != nil {
+		log.Printf("Stream error: %v", streamError)
 		fmt.Fprintf(w, "data: {\"error\": \"Ошибка генерации ответа\"}\n\n")
 		flusher.Flush()
 		return
@@ -2217,13 +2245,15 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 
-	// Обновляем контекст сессии
-	s.SessionManager.UpdateContext(session.ID, session.DialogContext)
+	// Обновляем контекст сессии ПОСЛЕ успешной генерации
+	s.SessionManager.UpdateContext(sessionID, dialogContext)
 
-	// Сохраняем в кэш
-	if globalCacheManager != nil {
-		cacheKey := BuildCacheKey(question, s.Config.OllamaModel, session.DialogContext.ToContextStrings())
-		globalCacheManager.Put(cacheKey, collectedAnswer.String(), streamSources, nil)
+	// Сохраняем в кэш ТОЛЬКО если всё успешно и есть fragmentIDs
+	// Для streaming нужно получить fragmentIDs из answerContext
+	if globalCacheManager != nil && streamError == nil && collectedAnswer.Len() > 0 && len(streamFragmentIDs) > 0 {
+		if err := globalCacheManager.Put(cacheKey, collectedAnswer.String(), streamSources, streamFragmentIDs); err != nil {
+			log.Printf("Cache save error: %v", err)
+		}
 	}
 }
 
@@ -2363,15 +2393,283 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 // MAIN
 // =========================================================
 
+
+func runCrawlCommand(cfg Config) {
+	log.Println("=== 🔄 Краулер сайта колледжа «Номос» ===")
+	log.Println()
+
+	// Парсим флаги после команды crawl
+	args := os.Args[2:]
+	var url string
+	maxDepth := 3
+	maxPages := 200
+	workers := 3
+
+	// Простой парсинг флагов
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-url" && i+1 < len(args) {
+			url = args[i+1]
+			i++
+		} else if args[i] == "-depth" && i+1 < len(args) {
+			fmt.Sscanf(args[i+1], "%d", &maxDepth)
+			i++
+		} else if args[i] == "-pages" && i+1 < len(args) {
+			fmt.Sscanf(args[i+1], "%d", &maxPages)
+			i++
+		} else if args[i] == "-workers" && i+1 < len(args) {
+			fmt.Sscanf(args[i+1], "%d", &workers)
+			i++
+		}
+	}
+
+	// Если URL не указан, используем из конфига
+	if url == "" {
+		url = cfg.NOMOSBase
+	}
+
+	log.Printf("📍 URL: %s", url)
+	log.Printf("🔍 Параметры: глубина=%d, страниц=%d, воркеров=%d", maxDepth, maxPages, workers)
+	log.Println()
+
+	// Инициализация БД
+	dbPath := filepath.Join("data", "erudit.db")
+	if err := os.MkdirAll("data", 0755); err != nil {
+		log.Fatalf("❌ Ошибка создания папки: %v", err)
+	}
+
+	db, err := InitDatabase(dbPath)
+	if err != nil {
+		log.Fatalf("❌ Ошибка инициализации БД: %v", err)
+	}
+	defer db.Close()
+	
+	// Сохраняем глобальную ссылку для гибридного поиска
+	globalDB = db
+
+	log.Printf("💾 База: %s", dbPath)
+	log.Println()
+
+	// Создаём и запускаем краулер
+	config := CrawlerConfig{
+		MaxDepth:        maxDepth,
+		MaxPages:        maxPages,
+		MaxFileSize:     10 * 1024 * 1024,
+		WorkerCount:     workers,
+		RequestDelay:    500 * time.Millisecond,
+		RequestTimeout:  30 * time.Second,
+		AllowedHosts:    []string{},
+		SkipExtensions:  []string{".jpg", ".jpeg", ".png", ".gif", ".css", ".js", ".xml", ".zip", ".rar", ".ico"},
+		SkipPaths:       []string{"/bitrix/", "/upload/iblock/", "/local/", "/ajax/"},
+		FollowRedirects: true,
+		MaxRedirects:    5,
+	}
+
+	crawler := NewCrawler(db, url, config)
+
+	log.Println("🚀 Запуск обхода...")
+	log.Println()
+
+	if err := crawler.Start(); err != nil {
+		log.Fatalf("❌ Ошибка обхода: %v", err)
+	}
+
+	log.Println()
+	log.Println("✅ Обход завершён успешно!")
+}
+
 var globalCacheManager *CacheManager
+
+
+// =========================================================
+// EMBEDDING COMMANDS
+// =========================================================
+
+func runSetupEmbeddingsCommand(cfg Config, modelName string) {
+	log.Println("=== 🔧 Настройка модели эмбеддингов ===")
+	log.Println()
+	
+	dbPath := filepath.Join("data", "erudit.db")
+	if err := os.MkdirAll("data", 0755); err != nil {
+		log.Fatalf("❌ Ошибка создания папки: %v", err)
+	}
+	
+	db, err := InitDatabase(dbPath)
+	if err != nil {
+		log.Fatalf("❌ Ошибка инициализации БД: %v", err)
+	}
+	defer db.Close()
+	
+	globalDB = db
+	
+	searchEngine, err := NewSearchEngine(db, cfg)
+	if err != nil {
+		log.Fatalf("❌ Ошибка создания поискового движка: %v", err)
+	}
+	
+	log.Printf("🔍 Проверка модели: %s", modelName)
+	log.Printf("📡 Ollama URL: %s", cfg.OllamaURL)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	
+	if err := searchEngine.SetupEmbeddings(ctx, modelName); err != nil {
+		log.Fatalf("❌ Ошибка настройки: %v", err)
+	}
+	
+	log.Println()
+	log.Println("✅ Модель эмбеддингов настроена!")
+	log.Println("💡 Теперь запустите: erudit generate-embeddings")
+}
+
+func runGenerateEmbeddingsCommand(cfg Config, batchSize int) {
+	log.Println("=== 🧮 Генерация эмбеддингов ===")
+	log.Println()
+	
+	dbPath := filepath.Join("data", "erudit.db")
+	db, err := InitDatabase(dbPath)
+	if err != nil {
+		log.Fatalf("❌ Ошибка инициализации БД: %v", err)
+	}
+	defer db.Close()
+	
+	globalDB = db
+	
+	searchEngine, err := NewSearchEngine(db, cfg)
+	if err != nil {
+		log.Fatalf("❌ Ошибка создания поискового движка: %v", err)
+	}
+	
+	if searchEngine.embeddingModel == "" {
+		log.Fatalf("❌ Модель эмбеддингов не настроена. Запустите: erudit setup-embeddings <model-name>")
+	}
+	
+	log.Printf("📊 Модель: %s (размерность: %d)", searchEngine.embeddingModel, searchEngine.embeddingDim)
+	log.Printf("📦 Размер батча: %d", batchSize)
+	log.Println()
+	
+	ctx := context.Background()
+	
+	// Генерируем эмбеддинги порциями
+	totalGenerated := 0
+	for {
+		err := searchEngine.GenerateEmbeddings(ctx, batchSize)
+		if err != nil {
+			log.Fatalf("❌ Ошибка генерации: %v", err)
+		}
+		
+		// Проверяем, остались ли ещё фрагменты
+		var remaining int
+		err = db.QueryRow(`
+			SELECT COUNT(*)
+			FROM fragments f
+			LEFT JOIN embeddings e ON f.id = e.fragment_id AND e.model_name = ?
+			WHERE e.id IS NULL
+		`, searchEngine.embeddingModel).Scan(&remaining)
+		
+		if err != nil || remaining == 0 {
+			break
+		}
+		
+		totalGenerated += batchSize
+		log.Printf("⏳ Осталось фрагментов: %d", remaining)
+		time.Sleep(1 * time.Second)
+	}
+	
+	log.Println()
+	log.Println("✅ Все эмбеддинги сгенерированы!")
+	log.Println("💡 Гибридный поиск активирован")
+}
+
+func runSearchStatusCommand(cfg Config) {
+	log.Println("=== 📊 Статус поискового движка ===")
+	log.Println()
+	
+	dbPath := filepath.Join("data", "erudit.db")
+	db, err := InitDatabase(dbPath)
+	if err != nil {
+		log.Fatalf("❌ Ошибка инициализации БД: %v", err)
+	}
+	defer db.Close()
+	
+	globalDB = db
+	
+	searchEngine, err := NewSearchEngine(db, cfg)
+	if err != nil {
+		log.Fatalf("❌ Ошибка создания поискового движка: %v", err)
+	}
+	
+	mode := searchEngine.GetSearchMode()
+	
+	// Статистика по фрагментам
+	var fragmentCount, embeddingCount int
+	db.QueryRow(`SELECT COUNT(*) FROM fragments`).Scan(&fragmentCount)
+	db.QueryRow(`SELECT COUNT(*) FROM embeddings`).Scan(&embeddingCount)
+	
+	log.Printf("🔍 Режим поиска: %s", mode)
+	log.Printf("📄 Фрагментов в индексе: %d", fragmentCount)
+	
+	if searchEngine.embeddingModel != "" {
+		log.Printf("🧮 Модель эмбеддингов: %s (размерность: %d)", searchEngine.embeddingModel, searchEngine.embeddingDim)
+		log.Printf("📊 Эмбеддингов: %d (%.1f%%)", embeddingCount, float64(embeddingCount)/float64(fragmentCount)*100)
+		log.Printf("⚖️  Веса: лексический=%.2f, семантический=%.2f", searchEngine.lexicalWeight, searchEngine.semanticWeight)
+		log.Printf("🎯 Минимальный порог: %.2f", searchEngine.minScoreThreshold)
+	} else {
+		log.Printf("⚠️  Эмбеддинги не настроены (только лексический поиск)")
+		log.Printf("💡 Для настройки: erudit setup-embeddings nomic-embed-text")
+	}
+	
+	// Статистика по страницам
+	var pageCount int
+	db.QueryRow(`SELECT COUNT(*) FROM pages`).Scan(&pageCount)
+	log.Printf("🌐 Страниц проиндексировано: %d", pageCount)
+	
+	log.Println()
+	log.Println("✅ Поисковый движок работает")
+}
+
+
+var globalDB *sql.DB
 
 func main() {
 	cfg := loadConfig()
 	
 	// Проверяем наличие аргументов командной строки
 	if len(os.Args) > 1 {
+		command := os.Args[1]
+		
+		// Команда crawl для запуска краулера
+		if command == "crawl" {
+			runCrawlCommand(cfg)
+			return
+		}
+		
+		// Команда setup-embeddings для настройки векторного поиска
+		if command == "setup-embeddings" {
+			if len(os.Args) < 3 {
+				log.Fatalf("Usage: erudit setup-embeddings <model-name>\nExample: erudit setup-embeddings nomic-embed-text")
+			}
+			runSetupEmbeddingsCommand(cfg, os.Args[2])
+			return
+		}
+		
+		// Команда generate-embeddings для генерации векторов
+		if command == "generate-embeddings" {
+			batchSize := 100
+			if len(os.Args) > 2 {
+				fmt.Sscanf(os.Args[2], "%d", &batchSize)
+			}
+			runGenerateEmbeddingsCommand(cfg, batchSize)
+			return
+		}
+		
+		// Команда search-status для проверки статуса поиска
+		if command == "search-status" {
+			runSearchStatusCommand(cfg)
+			return
+		}
+		
 		// Режим CLI - один вопрос без запуска сервера
-		question := os.Args[1]
+		question := command
 		
 		// Инициализация БД и кэша
 		dbPath := filepath.Join("data", "erudit.db")
@@ -2385,6 +2683,9 @@ func main() {
 		}
 		defer db.Close()
 		
+		// Сохраняем глобальную ссылку для гибридного поиска
+		globalDB = db
+		
 		// Вставка начальных источников
 		if err := InsertInitialSources(db, cfg.NOMOSBase); err != nil {
 			log.Fatalf("Failed to insert initial sources: %v", err)
@@ -2393,7 +2694,7 @@ func main() {
 		globalCacheManager = NewCacheManager(db)
 		
 		// Получаем ответ
-		answer, sources, err := GenerateAnswer(context.Background(), Config{
+		answer, sources, _, err := GenerateAnswer(context.Background(), Config{
 			NOMOSBase:   cfg.NOMOSBase,
 			OllamaURL:   cfg.OllamaURL,
 			OllamaModel: cfg.OllamaModel,
@@ -2428,6 +2729,9 @@ func main() {
 		log.Fatalf("Failed to init database: %v", err)
 	}
 	defer db.Close()
+	
+	// Сохраняем глобальную ссылку для гибридного поиска
+	globalDB = db
 	
 	// Вставка начальных источников
 	if err := InsertInitialSources(db, cfg.NOMOSBase); err != nil {

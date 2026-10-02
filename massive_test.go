@@ -167,7 +167,7 @@ func TestMassiveQuestions(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		
 		// Генерируем ответ
-		answer, sources, err := GenerateAnswer(ctx, cfg, tc.question, nil)
+		answer, sources, _, err := GenerateAnswer(ctx, cfg, tc.question, nil)
 		cancel()
 		
 		if err != nil {

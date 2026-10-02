@@ -23,11 +23,12 @@ type SearchQuery struct {
 
 // SearchResult представляет результат поиска
 type SearchResult struct {
-	Fragment  string
-	Source    Source
-	Relevance float64
-	Date      string
-	Metadata  map[string]string
+	Fragment   string
+	FragmentID int64 // ID фрагмента в БД для отслеживания версий
+	Source     Source
+	Relevance  float64
+	Date       string
+	Metadata   map[string]string
 }
 
 // PrepareSearchQuery преобразует интент в поисковый запрос

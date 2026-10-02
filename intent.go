@@ -102,6 +102,11 @@ func UnderstandIntent(question string, context *DialogContext) Intent {
 		if context != nil {
 			context.TopicChanged = true
 			context.LastEntities = make(map[string]string)
+			// Очищаем незавершенное ожидание уточнения при явной смене темы
+			context.PendingQuestion = ""
+			context.ExpectedParameter = ""
+			context.PartialInfo = nil
+			log.Printf("TOPIC CHANGE: cleared pending clarification")
 		}
 	} else {
 		intent.Type = "question"
@@ -114,14 +119,24 @@ func UnderstandIntent(question string, context *DialogContext) Intent {
 	intent.Anaphora = extractAnaphora(q)
 	
 	// 3. Разрешаем ссылки на предыдущий контекст
+	// ВАЖНО: делаем это ДО detectTopic, чтобы восстановленная тема не перезаписывалась
+	topicRestoredFromClarification := false
 	if context != nil {
 		resolveAnaphora(&intent, context)
+		// Если тема была восстановлена из уточнения, пометим это
+		if intent.Type == "clarification" && intent.Topic != "" {
+			topicRestoredFromClarification = true
+		}
 	} else {
 		log.Printf("SKIPPING resolveAnaphora: context is nil")
 	}
 	
-	// 4. Определяем тему
-	intent.Topic = detectTopic(q, context)
+	// 4. Определяем тему (но не перезаписываем восстановленную из уточнения)
+	if !topicRestoredFromClarification {
+		intent.Topic = detectTopic(q, context)
+	} else {
+		log.Printf("TOPIC PROTECTION: keeping restored topic='%s', not calling detectTopic", intent.Topic)
+	}
 	
 	// 5. Извлекаем сущности (специальность, группа, дата, и т.д.)
 	extractEntities(q, &intent, context)
@@ -182,36 +197,46 @@ func detectTopic(q string, context *DialogContext) string {
 
 // isGreeting проверяет приветствия
 func isGreeting(q string) bool {
-	// Только приветствие без вопроса
-	pureGreetings := []string{
-		"^привет$", "^привет!*$", "^здравствуй", "^добрый день", "^добрый вечер",
-		"^доброе утро", "^hi$", "^hello$", "^hey$",
+	// Проверяем, содержит ли вопрос приветственные слова
+	greetingWords := []string{
+		"привет", "здравствуй", "добрый день", "добрый вечер",
+		"доброе утро", "hi", "hello", "hey",
 	}
 	
-	for _, pattern := range pureGreetings {
-		matched, _ := regexp.MatchString(pattern, q)
-		if matched {
-			return true
+	hasGreeting := false
+	for _, greeting := range greetingWords {
+		if strings.HasPrefix(q, greeting) {
+			hasGreeting = true
+			break
 		}
 	}
 	
-	// Если есть вопросительные слова после приветствия, это не просто приветствие
-	questionWords := []string{"что", "как", "где", "когда", "какой", "какие", "какая", "сколько", "почему", "можно", "подскажи", "расскажи", "скажи"}
+	if !hasGreeting {
+		return false
+	}
+	
+	// Если есть приветствие, проверяем наличие вопросительных слов или знака вопроса
+	questionWords := []string{
+		"что", "как", "где", "когда", "какой", "какие", "какая", "сколько", 
+		"почему", "можно", "подскажи", "расскажи", "скажи", "нужн", "требуется",
+	}
+	
 	for _, word := range questionWords {
 		if strings.Contains(q, word) {
-			return false
+			return false // Есть вопрос после приветствия
 		}
 	}
 	
-	return false
+	if strings.Contains(q, "?") {
+		return false // Есть знак вопроса
+	}
+	
+	// Чистое приветствие без вопроса
+	return true
 }
 
 // isTopicChange определяет явную смену темы
 func isTopicChange(q string, context *DialogContext) bool {
-	if context == nil || len(context.History) == 0 {
-		return false
-	}
-	
 	changeMarkers := []string{
 		"другой вопрос", "теперь", "а теперь", "кстати",
 		"еще вопрос", "ещё вопрос", "смени тему", "хватит про",
@@ -248,58 +273,76 @@ func extractAnaphora(q string) []string {
 
 // resolveAnaphora разрешает ссылки на предыдущий контекст
 func resolveAnaphora(intent *Intent, context *DialogContext) {
-	if len(context.History) == 0 {
-		return
-	}
-	
-	lastTurn := context.History[len(context.History)-1]
 	q := normalize(intent.Question)
 	
 	// Обработка коротких ответов (продолжений)
 	isShortAnswer := len(strings.Fields(q)) <= 3
 	
-	// Если есть незавершенный вопрос и пользователь дает короткий ответ
-	if context.PendingQuestion != "" && context.ExpectedParameter != "" && isShortAnswer {
-		// Это уточнение к предыдущему вопросу
-		intent.Type = "clarification"
+	// ПРИОРИТЕТ 1: Обработка незавершенного вопроса (работает независимо от History)
+	if context.PendingQuestion != "" && context.ExpectedParameter != "" {
+		// Проверяем, является ли это ответом на уточнение или новым вопросом
+		// Новый вопрос имеет больше 5 слов или содержит явные вопросительные слова
+		wordCount := len(strings.Fields(q))
+		hasQuestionMark := strings.Contains(q, "?")
+		hasExplicitQuestion := containsAny(q, "расскажи", "подскажи", "скажи", "хочу узнать", 
+			"интересует", "где находится", "как добраться", "когда начинается", "что такое")
 		
-		// Восстанавливаем исходный вопрос и добавляем уточнение
-		if context.ExpectedParameter == "specialty" {
-			// Пользователь ответил названием специальности
-			// Формируем полный вопрос: исходный + уточнение
-			intent.Question = context.PendingQuestion + " по специальности " + q
+		isNewQuestion := (wordCount > 5 && hasQuestionMark) || hasExplicitQuestion
+		
+		if isShortAnswer && !isNewQuestion {
+			// Это уточнение к предыдущему вопросу
+			intent.Type = "clarification"
 			
-			// Извлекаем специальность из ответа пользователя
-			// Используем существующую логику extractEntities
-			extractEntities(q, intent, context)
-			
-			// Сразу устанавливаем тему из исходного вопроса
-			if context.PartialInfo != nil {
-				if topic, ok := context.PartialInfo["topic"]; ok {
-					intent.Topic = topic
+			// Восстанавливаем исходный вопрос и добавляем уточнение
+			if context.ExpectedParameter == "specialty" {
+				// Пользователь ответил названием специальности
+				// Формируем полный вопрос: исходный + уточнение
+				intent.Question = context.PendingQuestion + " по специальности " + q
+				
+				// Извлекаем специальность из ответа пользователя
+				extractEntities(q, intent, context)
+				
+				// Восстанавливаем тему из исходного вопроса
+				if context.PartialInfo != nil {
+					if topic, ok := context.PartialInfo["topic"]; ok {
+						intent.Topic = topic
+						log.Printf("CLARIFICATION: restored topic='%s' from PartialInfo", topic)
+					}
+					// Копируем уже известную информацию (кроме topic)
+					for k, v := range context.PartialInfo {
+						if k != "topic" {
+							intent.Entities[k] = v
+						}
+					}
 				}
+			} else if context.ExpectedParameter == "group" {
+				intent.Question = context.PendingQuestion + " для группы " + q
+			} else {
+				intent.Question = context.PendingQuestion + " " + q
 			}
-		} else if context.ExpectedParameter == "group" {
-			intent.Question = context.PendingQuestion + " для группы " + q
+			
+			// Очищаем ожидание после успешного разрешения
+			context.PendingQuestion = ""
+			context.ExpectedParameter = ""
+			context.PartialInfo = nil
+			
+			log.Printf("CLARIFICATION RESOLVED: question='%s' topic='%s' entities=%v", intent.Question, intent.Topic, intent.Entities)
+			return // Завершаем обработку, не продолжаем дальше
 		} else {
-			// Для других параметров просто объединяем
-			intent.Question = context.PendingQuestion + " " + q
+			// Новый вопрос во время ожидания уточнения - отменяем ожидание
+			log.Printf("CLARIFICATION CANCELLED: new question detected while pending")
+			context.PendingQuestion = ""
+			context.ExpectedParameter = ""
+			context.PartialInfo = nil
 		}
-		
-		// Копируем уже известную информацию
-		for k, v := range context.PartialInfo {
-			if k != "topic" { // topic уже обработали выше
-				intent.Entities[k] = v
-			}
-		}
-		
-		// Очищаем ожидание
-		context.PendingQuestion = ""
-		context.ExpectedParameter = ""
-		context.PartialInfo = nil
-		
-		log.Printf("CLARIFICATION RESOLVED: question='%s' topic='%s' entities=%v", intent.Question, intent.Topic, intent.Entities)
 	}
+	
+	// ПРИОРИТЕТ 2: Обработка анафор из предыдущих реплик (требует History)
+	if len(context.History) == 0 {
+		return
+	}
+	
+	lastTurn := context.History[len(context.History)-1]
 	
 	// Копируем сущности из предыдущего контекста
 	log.Printf("RESOLVE_ANAPHORA: before copy - intent.Entities=%v context.LastEntities=%v", intent.Entities, context.LastEntities)
@@ -371,22 +414,23 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 func detectSpecialtyInText(text string) string {
 	text = normalize(text)
 	
+	// Возвращаем полное название специальности, а не код
 	specialties := map[string]string{
-		"дизайн":             "54.02.01",
-		"графический дизайн": "54.02.01",
-		"юрист":              "40.02.04",
-		"юриспруденц":        "40.02.04",
-		"юридическ":          "40.02.04",
-		"право":              "40.02.01",
-		"социальн":           "40.02.01",
-		"преподав":           "44.02.02",
-		"начальн":            "44.02.02",
-		"учитель":            "44.02.02",
+		"дизайн":             "дизайн",
+		"графический дизайн": "дизайн",
+		"юрист":              "юриспруденция",
+		"юриспруденц":        "юриспруденция",
+		"юридическ":          "юриспруденция",
+		"право":              "право и социальное обеспечение",
+		"социальн":           "право и социальное обеспечение",
+		"преподав":           "преподавание в начальных классах",
+		"начальн":            "преподавание в начальных классах",
+		"учитель":            "преподавание в начальных классах",
 	}
 	
-	for pattern, code := range specialties {
+	for pattern, name := range specialties {
 		if strings.Contains(text, pattern) {
-			return code
+			return name
 		}
 	}
 	
@@ -397,27 +441,32 @@ func detectSpecialtyInText(text string) string {
 
 // extractEntities извлекает сущности из вопроса
 func extractEntities(q string, intent *Intent, context *DialogContext) {
-	// Специальности
-	specialties := map[string]string{
-		"дизайн":             "54.02.01",
-		"графический дизайн": "54.02.01",
-		"юрист":              "40.02.04",
-		"право":              "40.02.04",
-		"юриспруденц":        "40.02.04",
-		"программир":         "09.02.07",
-		"информационн":       "09.02.07",
-		"сети":               "09.02.06",
-		"системн":            "09.02.07",
-		"туризм":             "43.02.16",
-		"туристическ":        "43.02.16",
-		"экономик":           "38.02.01",
-		"бухгалтер":          "38.02.01",
+	// Специальности - сопоставление паттернов с полными названиями
+	specialtyPatterns := map[string]struct{
+		name string
+		code string
+	}{
+		"дизайн":             {"дизайн", "54.02.01"},
+		"графический дизайн": {"дизайн", "54.02.01"},
+		"юрист":              {"юриспруденция", "40.02.04"},
+		"право":              {"юриспруденция", "40.02.04"},
+		"юриспруденц":        {"юриспруденция", "40.02.04"},
+		"программир":         {"программирование", "09.02.07"},
+		"информационн":       {"информационные системы", "09.02.07"},
+		"сети":               {"компьютерные сети", "09.02.06"},
+		"системн":            {"информационные системы", "09.02.07"},
+		"туризм":             {"туризм", "43.02.16"},
+		"туристическ":        {"туризм", "43.02.16"},
+		"экономик":           {"экономика", "38.02.01"},
+		"бухгалтер":          {"экономика", "38.02.01"},
+		"преподав":           {"преподавание в начальных классах", "44.02.02"},
+		"начальн":            {"преподавание в начальных классах", "44.02.02"},
 	}
 	
-	for name, code := range specialties {
-		if strings.Contains(q, name) {
-			intent.Entities["specialty"] = name
-			intent.Entities["specialty_code"] = code
+	for pattern, spec := range specialtyPatterns {
+		if strings.Contains(q, pattern) {
+			intent.Entities["specialty"] = spec.name
+			intent.Entities["specialty_code"] = spec.code
 			break
 		}
 	}

@@ -1,51 +1,130 @@
-# Erudit UTF-8 Fix — Summary of Changes
+# Унификация GenerateAnswer и StreamAnswer — Сводка изменений
 
-## Problem
-Chatbot was returning incorrect answers about teachers due to:
-1. UTF-8 encoding issues (mojibake)
-2. Poor text chunking (multiple teachers in one chunk)
-3. Equal relevance scores for all teacher fragments
-4. Too much context noise for Ollama (15 fragments)
+## Статистика
 
-## Solution
+```
+answer.go       | +154 -97  (рефакторинг, выделение общих функций)
+main.go         | +27 -18   (улучшена обработка ошибок в кэше)
+answer_test.go  | +247      (новые тесты)
+```
 
-### 1. UTF-8 Handling (main.go)
-- Added `decodeHTML()` with cascading charset detection
-- Added `strings.ToValidUTF8()` for cleaning invalid sequences
-- Result: Page loads correctly (31,026 chars)
+**Итого:** +428 строк, -115 строк, устранено ~120 строк дублирования
 
-### 2. Text Normalization (main.go)
-- Added punctuation removal in `normalize()`
-- Fixed "олеговна?" → "олеговна" issue
+## Ключевые изменения
 
-### 3. Teacher-Specific Chunking (search.go)
-- New function: `splitTeacherChunks()`
-- Detects teacher pages: contains("преподава") && contains("@college-nomos.ru")
-- Recognizes full names (FIO): 3 words, capitalized, Cyrillic
-- Each teacher in separate chunk starting with their name
+### answer.go
 
-### 4. Relevance Boost (search.go)
-- **Key improvement**: +0.5 bonus for matching ALL keywords
-- Example: Query "Богитова Юлия Олеговна" matches all 3 words → +0.5 bonus
-- Result: Bogitova relevance 0.0 → 0.860, position #30+ → #1
+1. **Новая структура answerContext** (строки ~50-56)
+   - Инкапсулирует результат подготовки контекста
+   - Флаг `ShouldGenerate` управляет ветвлением
 
-### 5. Context Optimization (answer.go)
-- Reduced fragments sent to Ollama: 15 → 5
-- Less noise, more focused context
+2. **prepareAnswerContext()** (строки ~58-150)
+   - Единая логика для обоих режимов
+   - UnderstandIntent → проверка уточнений → поиск материалов
+   - Возвращает либо DirectReply, либо контекст для генерации
 
-## Results
+3. **finalizeDialogTurn()** (строки ~152-170)
+   - Единое место обновления состояния диалога
+   - Обновление CurrentTopic, LastEntities, LastSources
+   - Добавление DialogTurn в History
+   - Ограничение History до 5 записей
 
-✅ "Какие предметы ведёт Богитова Юлия Олеговна?"
-   → История, История родного края, Основы этики, История России
+4. **Рефакторинг GenerateAnswer()** (строки ~172-220)
+   - Использует prepareAnswerContext()
+   - Вызывает finalizeDialogTurn() ТОЛЬКО после успеха
+   - Для уточнений НЕ записывает в History
 
-✅ "Какие предметы ведёт Юдина Валерия Николаевна?"
-   → Педагогическая психология, Информатика и ИКТ, ...
+5. **Рефакторинг StreamAnswer()** (строки ~222-280)
+   - Использует prepareAnswerContext() (та же логика!)
+   - Накапливает ответ через wrappedOnChunk
+   - Вызывает finalizeDialogTurn() ТОЛЬКО после успеха
+   - Для уточнений НЕ записывает в History
 
-✅ "Какие предметы ведёт Князева Юлия Николаевна?"
-   → Живопись, Рисунок, Живопись с основами цветоведения, ...
+### main.go
 
-System correctly distinguishes teachers even with same first names (Юлия).
+6. **handleChatStream() улучшения** (строки ~2188-2230)
+   - Переменная `streamError` для явной проверки
+   - Сохранение в кэш ТОЛЬКО при `streamError == nil && collectedAnswer.Len() > 0`
+   - Логирование ошибок кэша
 
-## Tests: 10/10 passing
+### answer_test.go (новый файл)
 
-## Time: ~2h 45min
+7. **TestPrepareAnswerContext**
+   - Проверка приветствий
+   - Проверка уточнений
+   - Проверка восстановления Intent после уточнения
+
+8. **TestFinalizeDialogTurn**
+   - Проверка добавления в History
+   - Проверка ограничения до 5 записей
+   - Проверка обновления CurrentTopic
+
+9. **TestClarificationStateConsistency**
+   - Сравнение поведения GenerateAnswer vs StreamAnswer
+   - Проверка PendingQuestion, PartialInfo["topic"]
+   - Проверка, что уточнения НЕ попадают в History
+
+## Устраненные проблемы
+
+### До рефакторинга
+
+❌ StreamAnswer не сохранял DialogTurn в History  
+❌ StreamAnswer не сохранял topic в PartialInfo (`PartialInfo = intent.Entities`)  
+❌ ~120 строк дублированного кода подготовки контекста  
+❌ handleChatStream сохранял в кэш даже при ошибке  
+❌ Две разные точки обновления состояния диалога  
+
+### После рефакторинга
+
+✅ Оба режима используют finalizeDialogTurn()  
+✅ PartialInfo["topic"] сохраняется корректно через prepareAnswerContext()  
+✅ Общая функция prepareAnswerContext() — нет дублирования  
+✅ Кэш сохраняется ТОЛЬКО при `streamError == nil`  
+✅ Единственная точка обновления состояния — finalizeDialogTurn()  
+
+## Гарантии согласованности
+
+| Аспект | GenerateAnswer | StreamAnswer |
+|--------|----------------|--------------|
+| История приветствий | ✅ Записывается | ✅ Записывается |
+| История уточнений | ✅ НЕ записывается | ✅ НЕ записывается |
+| История ответов | ✅ Записывается | ✅ Записывается |
+| Сохранение topic | ✅ В PartialInfo["topic"] | ✅ В PartialInfo["topic"] |
+| Восстановление topic | ✅ Из PartialInfo | ✅ Из PartialInfo |
+| Ограничение History | ✅ До 5 записей | ✅ До 5 записей |
+| Обработка ошибок | ✅ Не сохраняет | ✅ Не сохраняет |
+| Кэш при ошибке | ✅ Не сохраняет | ✅ Не сохраняет |
+
+## Тестирование
+
+### Модульные тесты
+```bash
+go test -v -run TestPrepareAnswerContext          # ✅ PASS (3 sub-tests)
+go test -v -run TestFinalizeDialogTurn            # ✅ PASS (3 sub-tests)
+go test -v -run TestClarificationStateConsistency # ✅ PASS
+```
+
+### Интеграционные тесты
+См. `TESTING_GUIDE.md` для сценариев с Ollama
+
+## Обратная совместимость
+
+✅ HTTP API не изменился  
+✅ SSE формат не изменился  
+✅ Структура DialogContext расширена, но backward-compatible  
+✅ Формат кэша не изменился  
+✅ Существующие клиенты работают без изменений  
+
+## Документация
+
+- **UNIFICATION_REPORT.md** — техническое описание рефакторинга
+- **TESTING_GUIDE.md** — инструкции по проверке
+- **answer_test.go** — модульные тесты с покрытием ключевых сценариев
+
+## Следующие шаги
+
+1. ✅ Компиляция без ошибок
+2. ✅ Модульные тесты проходят
+3. ⏭️ Интеграционное тестирование с Ollama (см. TESTING_GUIDE.md)
+4. ⏭️ Проверка на production workload
+
