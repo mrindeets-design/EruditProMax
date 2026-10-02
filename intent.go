@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"log"
@@ -114,8 +114,10 @@ func UnderstandIntent(question string, context *DialogContext) Intent {
 	intent.Anaphora = extractAnaphora(q)
 	
 	// 3. Разрешаем ссылки на предыдущий контекст
-	if len(intent.Anaphora) > 0 && context != nil {
+	if context != nil {
 		resolveAnaphora(&intent, context)
+	} else {
+		log.Printf("SKIPPING resolveAnaphora: context is nil")
 	}
 	
 	// 4. Определяем тему
@@ -128,7 +130,7 @@ func UnderstandIntent(question string, context *DialogContext) Intent {
 	extractConditions(q, &intent)
 	
 	// 7. Проверяем неоднозначность
-	checkAmbiguity(&intent, q)
+	checkAmbiguity(&intent, q, context)
 	
 	return intent
 }
@@ -257,7 +259,7 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 	isShortAnswer := len(strings.Fields(q)) <= 3
 	
 	// Если есть незавершенный вопрос и пользователь дает короткий ответ
-	if context.PendingQuestion != "" && context.ExpectedParameter != "" {
+	if context.PendingQuestion != "" && context.ExpectedParameter != "" && isShortAnswer {
 		// Это уточнение к предыдущему вопросу
 		intent.Type = "clarification"
 		
@@ -270,6 +272,13 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 			// Извлекаем специальность из ответа пользователя
 			// Используем существующую логику extractEntities
 			extractEntities(q, intent, context)
+			
+			// Сразу устанавливаем тему из исходного вопроса
+			if context.PartialInfo != nil {
+				if topic, ok := context.PartialInfo["topic"]; ok {
+					intent.Topic = topic
+				}
+			}
 		} else if context.ExpectedParameter == "group" {
 			intent.Question = context.PendingQuestion + " для группы " + q
 		} else {
@@ -279,20 +288,27 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 		
 		// Копируем уже известную информацию
 		for k, v := range context.PartialInfo {
-			intent.Entities[k] = v
+			if k != "topic" { // topic уже обработали выше
+				intent.Entities[k] = v
+			}
 		}
 		
 		// Очищаем ожидание
 		context.PendingQuestion = ""
 		context.ExpectedParameter = ""
+		context.PartialInfo = nil
+		
+		log.Printf("CLARIFICATION RESOLVED: question='%s' topic='%s' entities=%v", intent.Question, intent.Topic, intent.Entities)
 	}
 	
 	// Копируем сущности из предыдущего контекста
+	log.Printf("RESOLVE_ANAPHORA: before copy - intent.Entities=%v context.LastEntities=%v", intent.Entities, context.LastEntities)
 	for k, v := range context.LastEntities {
 		if _, exists := intent.Entities[k]; !exists {
 			intent.Entities[k] = v
 		}
 	}
+	log.Printf("RESOLVE_ANAPHORA: after copy - intent.Entities=%v", intent.Entities)
 	
 	// Наследуем тему, если текущая не определена чётко
 	if intent.Topic == "general" && context.CurrentTopic != "" && !context.TopicChanged {
@@ -462,7 +478,7 @@ func extractConditions(q string, intent *Intent) {
 }
 
 // checkAmbiguity проверяет неоднозначность вопроса
-func checkAmbiguity(intent *Intent, q string) {
+func checkAmbiguity(intent *Intent, q string, context *DialogContext) {
 	// Вопрос требует уточнения, если:
 	
 	// 1. Упоминается несколько специальностей без явного сравнения
@@ -489,6 +505,22 @@ func checkAmbiguity(intent *Intent, q string) {
 				break
 			}
 		}
+		
+		// Проверяем, есть ли специальность в entities (уже извлеченная)
+		if !hasSpecialty && intent.Entities["specialty"] != "" {
+			hasSpecialty = true
+		}
+		
+		// Проверяем контекст - если в предыдущем ответе была специальность, используем её
+		if !hasSpecialty && context != nil && context.LastEntities["specialty"] != "" {
+			// Наследуем специальность из контекста
+			intent.Entities["specialty"] = context.LastEntities["specialty"]
+			hasSpecialty = true
+			log.Printf("checkAmbiguity: inherited specialty='%s' from context.LastEntities", intent.Entities["specialty"])
+		} else if !hasSpecialty && context != nil {
+			log.Printf("checkAmbiguity: NO specialty in context! context.LastEntities=%v", context.LastEntities)
+		}
+		
 		// Не требуем уточнения для общих вопросов типа "Есть ли бюджетные места?"
 		if !hasSpecialty && !containsAny(q, "вообще", "в принципе", "есть ли", "бывают ли") {
 			intent.IsAmbiguous = true
@@ -513,17 +545,29 @@ func checkAmbiguity(intent *Intent, q string) {
 }
 
 // BuildClarificationQuestion формирует уточняющий вопрос
-func BuildClarificationQuestion(intent Intent) string {
+func BuildClarificationQuestion(intent Intent, dialogContext *DialogContext) string {
 	if !intent.IsAmbiguous {
 		return ""
 	}
 	
 	q := normalize(intent.Question)
 	
+	log.Printf("BuildClarificationQuestion: q='%s' topic='%s' entities=%v", q, intent.Topic, intent.Entities)
+	
 	// Неоднозначная специальность для вопросов о стоимости/бюджете
 	if containsAny(q, "стоимость", "цена", "оплат", "бюджет", "платн", "контракт") {
 		if _, hasSpec := intent.Entities["specialty"]; !hasSpec {
-			return "Уточните, пожалуйста, о какой специальности вы спрашиваете: дизайн, юриспруденция, преподавание в начальных классах или право и социальное обеспечение?"
+			// Проверяем, есть ли специальность в контексте диалога
+			if dialogContext != nil && dialogContext.LastEntities != nil {
+				if _, hasSpecInContext := dialogContext.LastEntities["specialty"]; hasSpecInContext {
+					log.Printf("BuildClarificationQuestion: specialty found in LastEntities, no clarification needed")
+					return "" // Специальность уже известна из контекста
+				}
+			}
+			
+			clarification := "Уточните, пожалуйста, о какой специальности вы спрашиваете: дизайн, юриспруденция, преподавание в начальных классах или право и социальное обеспечение?"
+			log.Printf("BuildClarificationQuestion: returning payment clarification")
+			return clarification
 		}
 	}
 	
@@ -539,5 +583,7 @@ func BuildClarificationQuestion(intent Intent) string {
 		}
 	}
 	
+	log.Printf("BuildClarificationQuestion: returning empty (no match)")
 	return ""
 }
+

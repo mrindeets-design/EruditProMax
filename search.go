@@ -97,6 +97,11 @@ func splitCompoundQuestion(question string) []string {
 
 // SearchMaterials ищет релевантные материалы
 func SearchMaterials(ctx context.Context, cfg Config, queries []SearchQuery) ([]SearchResult, error) {
+	return SearchMaterialsWithContext(ctx, cfg, queries, nil)
+}
+
+// SearchMaterialsWithContext ищет релевантные материалы с учетом контекста диалога
+func SearchMaterialsWithContext(ctx context.Context, cfg Config, queries []SearchQuery, dialogContext *DialogContext) ([]SearchResult, error) {
 	allResults := []SearchResult{}
 	
 	for _, query := range queries {
@@ -113,7 +118,7 @@ func SearchMaterials(ctx context.Context, cfg Config, queries []SearchQuery) ([]
 			pages = append(pages, page)
 		}
 		
-		results := extractRelevantFragments(query, pages)
+		results := extractRelevantFragmentsWithContext(query, pages, dialogContext)
 		allResults = append(allResults, results...)
 	}
 	
@@ -307,9 +312,20 @@ func calculateSourceScore(src Source, query SearchQuery) int {
 
 // extractRelevantFragments извлекает релевантные фрагменты из страниц
 func extractRelevantFragments(query SearchQuery, pages []CachedPage) []SearchResult {
+	return extractRelevantFragmentsWithContext(query, pages, nil)
+}
+
+// extractRelevantFragmentsWithContext извлекает релевантные фрагменты с учетом контекста диалога
+func extractRelevantFragmentsWithContext(query SearchQuery, pages []CachedPage, dialogContext *DialogContext) []SearchResult {
 	results := []SearchResult{}
 	
 	log.Printf("EXTRACT FRAGMENTS: query=%s, pages=%d", query.Text, len(pages))
+	
+	// Если есть контекст диалога, логируем его
+	if dialogContext != nil {
+		log.Printf("EXTRACT FRAGMENTS: dialogContext.CurrentTopic=%s, LastEntities=%v", 
+			dialogContext.CurrentTopic, dialogContext.LastEntities)
+	}
 	
 	for _, page := range pages {
 		paragraphs := splitIntoSemanticChunks(page.Text)
@@ -318,7 +334,7 @@ func extractRelevantFragments(query SearchQuery, pages []CachedPage) []SearchRes
 			page.Source.Name, len(page.Text), len(paragraphs))
 		
 		for i, para := range paragraphs {
-			relevance := calculateRelevance(query, para)
+			relevance := calculateRelevanceWithContext(query, para, dialogContext)
 			
 			// Логируем первые 3 фрагмента для отладки
 			if i < 3 {
@@ -327,6 +343,15 @@ func extractRelevantFragments(query SearchQuery, pages []CachedPage) []SearchRes
 					preview = preview[:100]
 				}
 				log.Printf("CHUNK[%d] relevance=%.3f: %s...", i, relevance, preview)
+			}
+			
+			// ОТЛАДКА: ищем фрагменты со словом "дизайн"
+			if strings.Contains(strings.ToLower(para), "дизайн") {
+				preview := para
+				if len(preview) > 150 {
+					preview = preview[:150]
+				}
+				log.Printf("DESIGN FRAGMENT FOUND (relevance=%.3f) from %s: %s...", relevance, page.Source.Name, preview)
 			}
 			
 			// Снижен порог с 0.1 до 0.05
@@ -502,16 +527,52 @@ func splitTeacherChunks(text string) []string {
 
 // calculateRelevance вычисляет релевантность фрагмента запросу
 func calculateRelevance(query SearchQuery, fragment string) float64 {
+	return calculateRelevanceWithContext(query, fragment, nil)
+}
+
+// calculateRelevanceWithContext вычисляет релевантность с учетом контекста диалога
+func calculateRelevanceWithContext(query SearchQuery, fragment string, dialogContext *DialogContext) float64 {
 	fragNorm := normalize(fragment)
 	score := 0.0
 	
 	keywords := extractKeywords(query.Text)
+	
+	// DEBUG: Логируем извлеченные ключевые слова для первого фрагмента
+	if len(keywords) > 0 {
+		fragPreview := fragNorm
+		if len(fragPreview) > 100 {
+			fragPreview = fragPreview[:100] + "..."
+		}
+		log.Printf("RELEVANCE: query='%s' -> keywords=%v, fragment='%s'", query.Text, keywords, fragPreview)
+	}
+	
+	// Применяем стемминг к ключевым словам и словам фрагмента
+	stemmedKeywords := make([]string, len(keywords))
+	for i, kw := range keywords {
+		stemmedKeywords[i] = stem(kw)
+	}
+	
+	// Стеммируем слова фрагмента
+	fragWords := strings.Fields(fragNorm)
+	stemmedFragWords := make(map[string]bool)
+	for _, word := range fragWords {
+		stemmedFragWords[stem(word)] = true
+	}
+	
 	matchedKeywords := 0
-	for _, kw := range keywords {
-		if strings.Contains(fragNorm, kw) {
+	for i, kwStem := range stemmedKeywords {
+		if stemmedFragWords[kwStem] {
 			matchedKeywords++
 			// УЛУЧШЕНИЕ: увеличиваем вес ключевых слов
 			score += 0.25 // было 0.2
+			log.Printf("RELEVANCE: matched keyword '%s' (stem: '%s')", keywords[i], kwStem)
+		} else {
+			// Попробуем также точное совпадение без стемминга (для коротких слов)
+			if strings.Contains(fragNorm, keywords[i]) {
+				matchedKeywords++
+				score += 0.25
+				log.Printf("RELEVANCE: matched keyword '%s' (exact)", keywords[i])
+			}
 		}
 	}
 	
@@ -528,10 +589,27 @@ func calculateRelevance(query SearchQuery, fragment string) float64 {
 		}
 	}
 	
+	// Проверяем entities из текущего запроса
 	for _, entity := range query.Entities {
 		entityNorm := normalize(entity)
 		if strings.Contains(fragNorm, entityNorm) {
 			score += 0.3
+		}
+	}
+	
+	// НОВОЕ: Бонус за совпадение с entities из контекста диалога
+	if dialogContext != nil && len(dialogContext.LastEntities) > 0 {
+		for key, entity := range dialogContext.LastEntities {
+			entityNorm := normalize(entity)
+			if strings.Contains(fragNorm, entityNorm) {
+				// Даем бонус, особенно для specialty
+				if key == "specialty" || key == "specialty_code" {
+					score += 0.4 // Большой бонус за совпадение специальности из контекста
+					log.Printf("RELEVANCE BOOST: found context entity '%s'='%s' in fragment", key, entity)
+				} else {
+					score += 0.2
+				}
+			}
 		}
 	}
 	
@@ -542,7 +620,13 @@ func calculateRelevance(query SearchQuery, fragment string) float64 {
 		}
 	}
 	
-	topicKeywords := getTopicKeywords(query.Topic)
+	// Определяем тему - сначала из запроса, потом из контекста
+	effectiveTopic := query.Topic
+	if effectiveTopic == "general" && dialogContext != nil && dialogContext.CurrentTopic != "" {
+		effectiveTopic = dialogContext.CurrentTopic
+	}
+	
+	topicKeywords := getTopicKeywords(effectiveTopic)
 	matchedTopicKW := 0
 	for _, kw := range topicKeywords {
 		if strings.Contains(fragNorm, kw) {
@@ -554,7 +638,7 @@ func calculateRelevance(query SearchQuery, fragment string) float64 {
 		score += 0.4 * float64(matchedTopicKW) / float64(len(topicKeywords)) // было 0.3
 	}
 	
-	if query.Topic != "general" {
+	if effectiveTopic != "general" {
 		hasTopicMatch := false
 		for _, kw := range topicKeywords {
 			if strings.Contains(fragNorm, kw) {
@@ -577,11 +661,13 @@ func extractKeywords(question string) []string {
 	stopWords := []string{
 		"как", "что", "где", "когда", "почему", "какой", "какая", "какие",
 		"кто", "сколько", "чего", "можно", "нужно", "есть", "быть",
-		"это", "этот", "эта", "эти", "мне", "меня", "вас", "вам",
+		"это", "этот", "эта", "эти", "мне", "меня", "вас", "вам", "для", "или", "на", "по", "из", "от", "до", "под",
 	}
 	
 	words := strings.Fields(q)
 	keywords := []string{}
+	
+	log.Printf("EXTRACT_KEYWORDS: question len=%d, normalized len=%d, words=%d", len(question), len(q), len(words))
 	
 	for _, word := range words {
 		if len(word) < 3 {
@@ -600,6 +686,8 @@ func extractKeywords(question string) []string {
 			keywords = append(keywords, word)
 		}
 	}
+	
+	log.Printf("EXTRACT_KEYWORDS: result=%v (from %d words)", keywords, len(words))
 	
 	return keywords
 }
@@ -683,6 +771,11 @@ func CheckSufficiency(query SearchQuery, results []SearchResult) bool {
 
 // RetrySearch повторяет поиск с альтернативными формулировками
 func RetrySearch(ctx context.Context, cfg Config, query SearchQuery, attempt int) ([]SearchResult, error) {
+	return RetrySearchWithContext(ctx, cfg, query, attempt, nil)
+}
+
+// RetrySearchWithContext повторяет поиск с альтернативными формулировками с учетом контекста
+func RetrySearchWithContext(ctx context.Context, cfg Config, query SearchQuery, attempt int, dialogContext *DialogContext) ([]SearchResult, error) {
 	if attempt > 2 {
 		return []SearchResult{}, nil
 	}
@@ -690,7 +783,7 @@ func RetrySearch(ctx context.Context, cfg Config, query SearchQuery, attempt int
 	log.Printf("Повторный поиск (попытка %d) для: %s", attempt, query.Text)
 	
 	altQueries := generateAlternativeQueries(query)
-	return SearchMaterials(ctx, cfg, altQueries)
+	return SearchMaterialsWithContext(ctx, cfg, altQueries, dialogContext)
 }
 
 // generateAlternativeQueries генерирует альтернативные формулировки
@@ -732,3 +825,4 @@ func generateAlternativeQueries(query SearchQuery) []SearchQuery {
 	
 	return alternatives
 }
+

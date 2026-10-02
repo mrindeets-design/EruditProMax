@@ -13,12 +13,13 @@ import (
 // =========================================================
 
 // GenerateAnswer формирует ответ на вопрос
+// Логика работы: 1) Понимание контекста → 2) Поиск информации → 3) Генерация ответа
 func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogContext *DialogContext) (string, []Source, error) {
 	startTime := time.Now()
 	
 	log.Printf("GenerateAnswer: START")
 	
-	// 1. Понимание вопроса
+	// ШАГ 1: Понимание контекста вопроса
 	intent := UnderstandIntent(question, dialogContext)
 	log.Printf("INTENT: type=%s topic=%s entities=%v confidence=%.2f", 
 		intent.Type, intent.Topic, intent.Entities, intent.Confidence)
@@ -26,13 +27,23 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	// 2. Проверка неоднозначности
 	// Не спрашиваем уточнение, если это ответ на предыдущее уточнение
 	if intent.IsAmbiguous && intent.Type != "clarification" {
-		clarification := BuildClarificationQuestion(intent)
+		clarification := BuildClarificationQuestion(intent, dialogContext)
 		if clarification != "" {
 			// Сохраняем контекст для будущего уточнения
 			if dialogContext != nil {
 				dialogContext.PendingQuestion = question
 				dialogContext.ExpectedParameter = "specialty" // Чаще всего требуется специальность
-				dialogContext.PartialInfo = intent.Entities
+				// Сохраняем тему вместе с другими данными
+				if dialogContext.PartialInfo == nil {
+					dialogContext.PartialInfo = make(map[string]string)
+				}
+				// Копируем entities
+				for k, v := range intent.Entities {
+					dialogContext.PartialInfo[k] = v
+				}
+				// Сохраняем тему для восстановления после уточнения
+				dialogContext.PartialInfo["topic"] = intent.Topic
+				log.Printf("ASKING CLARIFICATION: topic='%s' entities=%v", intent.Topic, intent.Entities)
 			}
 			return clarification, []Source{}, nil
 		}
@@ -40,19 +51,20 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	
 	// 3. Обработка приветствий
 	if intent.Type == "greeting" {
-		return "Здравствуйте! Я бот колледжа НОМОС. Могу ответить на вопросы о поступлении, специальностях, стоимости обучения и других темах. Задавайте ваш вопрос!", []Source{}, nil
+		return "Здравствуйте! Я Эрудит — помощник Воронежского колледжа «Номос». Могу рассказать о поступлении, специальностях, стоимости обучения, преподавателях и других вопросах. Чем могу помочь?", []Source{}, nil
 	}
 	
 	log.Printf("GenerateAnswer: Before PrepareSearchQuery")
 	
-	// 4. Подготовка поисковых запросов
+	// ШАГ 2: Поиск информации
+	// 2.1 Подготовка поисковых запросов
 	queries := PrepareSearchQuery(intent)
 	log.Printf("SEARCH QUERIES: %d запросов", len(queries))
 	
 	log.Printf("GenerateAnswer: Before SearchMaterials")
 	
-	// 5. Поиск материалов
-	results, err := SearchMaterials(ctx, cfg, queries)
+	// 2.2 Поиск материалов в базе данных
+	results, err := SearchMaterialsWithContext(ctx, cfg, queries, dialogContext)
 	if err != nil {
 		return "", nil, fmt.Errorf("ошибка поиска: %w", err)
 	}
@@ -68,7 +80,7 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	if !sufficient && len(results) < 3 && len(queries) > 0 {
 		// Повторный поиск
 		log.Printf("Результаты недостаточны, выполняем повторный поиск")
-		retryResults, err := RetrySearch(ctx, cfg, queries[0], 1)
+		retryResults, err := RetrySearchWithContext(ctx, cfg, queries[0], 1, dialogContext)
 		if err == nil && len(retryResults) > 0 {
 			results = append(results, retryResults...)
 			// Повторная дедупликация и сортировка
@@ -80,7 +92,8 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 		return "К сожалению, на сайте колледжа я не нашёл информации по этому вопросу. Уточните, пожалуйста, в приёмной комиссии по телефону +7 (473) 271-35-36.", []Source{}, nil
 	}
 	
-	// 7. Подготовка контекста для модели
+	// ШАГ 3: Генерация ответа
+	// 3.1 Подготовка контекста для модели
 	// УЛУЧШЕНИЕ: увеличиваем количество фрагментов для контекста
 	contextText, sources := buildContextFromResults(results, 8) // было 5
 	log.Printf("CONTEXT: %d символов из %d источников", len(contextText), len(sources))
@@ -95,7 +108,7 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	}
 	
 	// 8. Генерация ответа через Ollama
-	answer, err := askOllama(ctx, cfg, question, contextText)
+	answer, err := askOllama(ctx, cfg, question, contextText, dialogContext)
 	if err != nil {
 		return "", nil, fmt.Errorf("ошибка Ollama: %w", err)
 	}
@@ -103,7 +116,25 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 	// 9. Обновление контекста диалога
 	if dialogContext != nil {
 		dialogContext.CurrentTopic = intent.Topic
-		dialogContext.LastEntities = intent.Entities
+		
+		// Инициализируем LastEntities, если он nil
+		if dialogContext.LastEntities == nil {
+			dialogContext.LastEntities = make(map[string]string)
+		}
+		
+		log.Printf("CONTEXT UPDATE: Before update - LastEntities=%v, intent.Entities=%v", dialogContext.LastEntities, intent.Entities)
+		
+		// Объединяем сущности: сохраняем старые, если новые не переопределили их
+		if len(intent.Entities) > 0 {
+			// Если есть новые сущности, обновляем только их
+			for k, v := range intent.Entities {
+				dialogContext.LastEntities[k] = v
+			}
+		}
+		// Если сущностей нет вообще, не трогаем LastEntities (сохраняем контекст)
+		
+		log.Printf("CONTEXT UPDATE: After update - LastEntities=%v", dialogContext.LastEntities)
+		
 		dialogContext.LastSources = sources
 		
 		turn := DialogTurn{
@@ -168,7 +199,7 @@ func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContex
 	
 	// Не спрашиваем уточнение, если это ответ на предыдущее уточнение
 	if intent.IsAmbiguous && intent.Type != "clarification" {
-		clarification := BuildClarificationQuestion(intent)
+		clarification := BuildClarificationQuestion(intent, dialogContext)
 		if clarification != "" {
 			// Сохраняем контекст для будущего уточнения
 			if dialogContext != nil {
@@ -181,17 +212,17 @@ func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContex
 	}
 	
 	if intent.Type == "greeting" {
-		return onChunk("Здравствуйте! Я бот колледжа НОМОС. Могу ответить на вопросы о поступлении, специальностях, стоимости обучения и других темах. Задавайте ваш вопрос!")
+		return onChunk("Здравствуйте! Я Эрудит — помощник Воронежского колледжа «Номос». Могу рассказать о поступлении, специальностях, стоимости обучения, преподавателях и других вопросах. Чем могу помочь?")
 	}
 	
 	queries := PrepareSearchQuery(intent)
-	results, err := SearchMaterials(ctx, cfg, queries)
+	results, err := SearchMaterialsWithContext(ctx, cfg, queries, dialogContext)
 	if err != nil {
 		return err
 	}
 	
 	if len(queries) > 0 && !CheckSufficiency(queries[0], results) && len(results) < 3 {
-		retryResults, _ := RetrySearch(ctx, cfg, queries[0], 1)
+		retryResults, _ := RetrySearchWithContext(ctx, cfg, queries[0], 1, dialogContext)
 		if len(retryResults) > 0 {
 			results = append(results, retryResults...)
 			results = deduplicateResults(results)
@@ -210,7 +241,7 @@ func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContex
 	}
 	
 	// Streaming запрос к Ollama
-	err = streamOllama(ctx, cfg, question, contextText, onChunk)
+	err = streamOllama(ctx, cfg, question, contextText, dialogContext, onChunk)
 	
 	if dialogContext != nil {
 		dialogContext.CurrentTopic = intent.Topic
