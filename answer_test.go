@@ -198,7 +198,10 @@ func TestClarificationStateConsistency(t *testing.T) {
 		LastEntities: make(map[string]string),
 	}
 	
-	clarification1, _, _, err := GenerateAnswer(context.Background(), cfg, question, ctx1)
+	// Mock LLM provider для тестов
+	mockProvider := NewOllamaProvider(cfg.OllamaURL, cfg.OllamaModel, 90*time.Second)
+	
+	clarification1, _, _, err := GenerateAnswer(context.Background(), cfg, mockProvider, question, ctx1)
 	if err != nil {
 		t.Fatalf("GenerateAnswer error: %v", err)
 	}
@@ -210,7 +213,7 @@ func TestClarificationStateConsistency(t *testing.T) {
 	}
 	
 	var streamedClarification strings.Builder
-	err = StreamAnswer(context.Background(), cfg, question, ctx2,
+	err = StreamAnswer(context.Background(), cfg, mockProvider, question, ctx2,
 		func(chunk string) error {
 			streamedClarification.WriteString(chunk)
 			return nil

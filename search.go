@@ -35,8 +35,11 @@ type SearchResult struct {
 func PrepareSearchQuery(intent Intent) []SearchQuery {
 	queries := []SearchQuery{}
 	
+	// Создаём оптимизированный текст запроса на основе темы и сущностей
+	searchText := buildOptimalSearchText(intent)
+	
 	mainQuery := SearchQuery{
-		Text:       intent.Question,
+		Text:       searchText,
 		Topic:      intent.Topic,
 		Entities:   intent.Entities,
 		Conditions: intent.Conditions,
@@ -53,7 +56,7 @@ func PrepareSearchQuery(intent Intent) []SearchQuery {
 			if part != intent.Question {
 				subIntent := UnderstandIntent(part, nil)
 				subQuery := SearchQuery{
-					Text:       part,
+					Text:       buildOptimalSearchText(subIntent),
 					Topic:      subIntent.Topic,
 					Entities:   subIntent.Entities,
 					Conditions: subIntent.Conditions,
@@ -65,6 +68,47 @@ func PrepareSearchQuery(intent Intent) []SearchQuery {
 	}
 	
 	return queries
+}
+
+// buildOptimalSearchText создаёт оптимизированный текст для поиска
+func buildOptimalSearchText(intent Intent) string {
+	// Убираем приветствия и вежливые слова
+	text := intent.Question
+	text = strings.TrimSpace(text)
+	
+	// Убираем приветствия
+	greetings := []string{"привет", "здравствуйте", "добрый день", "добрый вечер", "доброе утро", "hi", "hello"}
+	for _, g := range greetings {
+		text = strings.TrimPrefix(strings.ToLower(text), g)
+		text = strings.TrimLeft(text, ", ")
+		text = strings.TrimSpace(text)
+	}
+	
+	// Убираем вежливые обращения
+	polite := []string{"подскажи", "подскажите", "скажи", "скажите", "расскажи", "расскажите", "пожалуйста"}
+	for _, p := range polite {
+		text = strings.ReplaceAll(strings.ToLower(text), p, "")
+		text = strings.TrimLeft(text, ", ")
+		text = strings.TrimSpace(text)
+	}
+	
+	// Если есть специальность в сущностях, добавляем её явно
+	if spec, ok := intent.Entities["specialty"]; ok && spec != "" {
+		// Проверяем, есть ли уже специальность в тексте
+		if !strings.Contains(strings.ToLower(text), strings.ToLower(spec)) {
+			text = text + " " + spec
+		}
+	}
+	
+	// Если есть код специальности, добавляем его явно для точного поиска
+	if code, ok := intent.Entities["specialty_code"]; ok && code != "" {
+		// Проверяем, есть ли уже код в тексте
+		if !strings.Contains(text, code) {
+			text = text + " " + code
+		}
+	}
+	
+	return strings.TrimSpace(text)
 }
 
 // splitCompoundQuestion разделяет составной вопрос на части
@@ -668,7 +712,7 @@ func extractKeywords(question string) []string {
 	words := strings.Fields(q)
 	keywords := []string{}
 	
-	log.Printf("EXTRACT_KEYWORDS: question len=%d, normalized len=%d, words=%d", len(question), len(q), len(words))
+	log.Printf("EXTRACT_KEYWORDS: question='%s' len=%d, normalized='%s' len=%d, words=%d", question, len(question), q, len(q), len(words))
 	
 	for _, word := range words {
 		if len(word) < 3 {

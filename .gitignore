@@ -48,3 +48,8 @@ dist/
 *.txt
 bogitova_priority_output.txt
 teacher_chunking_output.txt
+
+# Environment and secrets
+.env
+.env.local
+

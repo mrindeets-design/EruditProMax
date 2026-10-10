@@ -1,44 +1,58 @@
-2026/09/27 20:49:17 DB schema version: 1 (target: 1)
-2026/09/27 20:49:17 Sources table already populated (8 records)
-2026/09/27 20:49:17 Cache manager initialized
-2026/09/27 20:49:17 Session manager initialized
-2026/09/27 20:49:17 ========================================
-2026/09/27 20:49:17 Erudit backend running on :3000
-2026/09/27 20:49:17 NOMOS: https://college-nomos.ru
-2026/09/27 20:49:17 Ollama: http://127.0.0.1:11434
-2026/09/27 20:49:17 Ollama model: qwen2.5:7b-instruct
-2026/09/27 20:49:17 Widget: http://localhost:3000/widget/chat.html
-2026/09/27 20:49:17 Chat API: http://localhost:3000/api/chat
-2026/09/27 20:49:17 ========================================
-2026/09/27 20:49:30 Вопрос [session=800644ec]: ????? ????????????? ???????? ? ?????????
-2026/09/27 20:49:30 CACHE MISS: 8f70a6b599cec830
-2026/09/27 20:49:30 GenerateAnswer: START
-2026/09/27 20:49:30 INTENT: type=question topic= entities=map[] confidence=1.00
-2026/09/27 20:49:30 GenerateAnswer: Before PrepareSearchQuery
-2026/09/27 20:49:30 SEARCH QUERIES: 1 запросов
-2026/09/27 20:49:30 GenerateAnswer: Before SearchMaterials
-2026/09/27 20:49:30 SELECTED SOURCES: 10 из 31 (top score: 10)
-2026/09/27 20:49:30   [1] score=10: Главная страница (general)
-2026/09/27 20:49:30   [2] score=10: Поступающим (admission)
-2026/09/27 20:49:30   [3] score=10: Специальности (список) (specialties)
-2026/09/27 20:49:30   [4] score=10: Образование (education)
-2026/09/27 20:49:30   [5] score=10: Документы (documents)
-2026/09/27 20:49:30 NOMOS URL: https://college-nomos.ru/
-2026/09/27 20:49:31 NOMOS URL: https://college-nomos.ru/abitur/postupayushchim/
-2026/09/27 20:49:31 NOMOS URL: https://college-nomos.ru/abitur/specialties/
-2026/09/27 20:49:31 NOMOS URL: https://college-nomos.ru/sveden/education/
-2026/09/27 20:49:32 NOMOS URL: https://college-nomos.ru/sveden/document/
-2026/09/27 20:49:32 NOMOS URL: https://college-nomos.ru/sveden/paid_edu/
-2026/09/27 20:49:32 NOMOS URL: https://college-nomos.ru/sveden/objects/
-2026/09/27 20:49:32 NOMOS URL: https://college-nomos.ru/sveden/grants/
-2026/09/27 20:49:32 NOMOS URL: https://college-nomos.ru/sveden/vacant/
-2026/09/27 20:49:32 NOMOS URL: https://college-nomos.ru/teachers/
-2026/09/27 20:49:33 SEARCH RESULTS: найдено 0 фрагментов
-2026/09/27 20:49:33 Результаты недостаточны, выполняем повторный поиск
-2026/09/27 20:49:33 Повторный поиск (попытка 1) для: ????? ????????????? ???????? ? ?????????
-2026/09/27 20:49:33 SELECTED SOURCES: 10 из 31 (top score: 10)
-2026/09/27 20:49:33   [1] score=10: Главная страница (general)
-2026/09/27 20:49:33   [2] score=10: Поступающим (admission)
-2026/09/27 20:49:33   [3] score=10: Специальности (список) (specialties)
-2026/09/27 20:49:33   [4] score=10: Образование (education)
-2026/09/27 20:49:33   [5] score=10: Документы (documents)
+2026/10/03 14:06:54 ✅ SQLite configured: foreign_keys=1, busy_timeout=10000 ms, journal_mode=wal
+2026/10/03 14:06:54 DB schema version: 2 (target: 2)
+2026/10/03 14:06:54 Sources table already populated (94 records)
+2026/10/03 14:06:54 Cache manager initialized
+2026/10/03 14:06:54 Session manager initialized
+2026/10/03 14:06:54 LLM Provider: external (OpenAI-compatible)
+2026/10/03 14:06:54 ========================================
+2026/10/03 14:06:54 Erudit backend running on :3000
+2026/10/03 14:06:54 NOMOS: https://college-nomos.ru
+2026/10/03 14:06:54 LLM PROVIDER: external
+2026/10/03 14:06:54 LLM TIMEOUT: 1m0s
+2026/10/03 14:06:54 LLM BASE URL: https://api.openai.com/v1
+2026/10/03 14:06:54 LLM MODEL: gpt-4o-mini
+2026/10/03 14:06:54 Widget: http://localhost:3000/widget/chat.html
+2026/10/03 14:06:54 Chat API: http://localhost:3000/api/chat
+2026/10/03 14:06:54 ========================================
+2026/10/03 14:07:34 Вопрос [session=0b1d629938dc31f156d35df79ecb5a38]: Привет
+2026/10/03 14:07:34 CACHE MISS: 32b78919a2374b08
+2026/10/03 14:07:34 GenerateAnswer: START
+2026/10/03 14:07:34 INTENT: type=greeting topic=general entities=map[] confidence=1.00
+2026/10/03 14:07:34 CONTEXT UPDATE: Before update - LastEntities=map[], intent.Entities=map[]
+2026/10/03 14:07:34 CONTEXT UPDATE: After update - LastEntities=map[]
+2026/10/03 14:07:34 DIALOG: turn added, history size=1, topic=general
+2026/10/03 14:07:34 DIRECT REPLY: 1.0424ms
+2026/10/03 14:07:34 CACHE: NOT saving (answer not verified or no evidence)
+2026/10/03 14:07:40 Вопрос [session=d2e6fbe0f691586d7db21afbfa29f2ae]: Какие есть специальности?
+2026/10/03 14:07:40 CACHE MISS: c7bab227e5295b8f
+2026/10/03 14:07:40 GenerateAnswer: START
+2026/10/03 14:07:40 DETECT TOPIC: normalized query = 'какие есть специальности'
+2026/10/03 14:07:40 DETECT TOPIC: result = 'general' (matches=0)
+2026/10/03 14:07:40 DETECT TOPIC: using context topic = ''
+2026/10/03 14:07:40 INTENT: type=question topic= entities=map[] confidence=1.00
+2026/10/03 14:07:40 SEARCH QUERIES: 1 запросов
+2026/10/03 14:07:40 GenerateAnswer: Before SearchMaterials
+2026/10/03 14:07:40 Search mode: lexical
+2026/10/03 14:07:40 FTS5 query: original='какие есть специальности?' -> fts='какие* OR есть* OR специальности*'
+2026/10/03 14:07:40 Hybrid search found 15 results
+2026/10/03 14:07:40 SEARCH RESULTS: найдено 15 фрагментов
+2026/10/03 14:07:40 CONTEXT: 7604 символов из 4 источников, 8 фрагментов
+2026/10/03 14:07:40 CONTEXT PREVIEW: 
+=== Фрагмент 1 (релевантность: 0.92) ===
+Источник: Основные сведения
+Дата: 2026-10-02T14:46:36Z
+получить в результате обучения как в колледже, так и в ВУЗе). Процесс обучения в колледже не предусматривает занятий научной деятельностью, а ориентирован на академическое образование.
+Колледж...
+2026/10/03 14:07:40 GenerateAnswer: Before LLM generation
+2026/10/03 14:07:40 QUESTION TO LLM: original='Какие есть специальности?' intent='Какие есть специальности?' using='Какие есть специальности?'
+2026/10/03 14:07:40 LLM REQUEST: provider=external model=gpt-4o-mini endpoint=https://api.openai.com/v1/chat/completions
+2026/10/03 14:07:43 LLM REQUEST FAILED: provider=external model=gpt-4o-mini status=401 duration=3.1587338s body={
+  "error": {
+    "message": "Incorrect API key provided: sk-test-***********************-key. You can find your API key at https://platform.openai.com/account/api-keys.",
+    "type": "invalid_request_error",
+    "code": "invalid_api_key",
+    "param": null
+  },
+  "status": 401
+}
+2026/10/03 14:07:43 Ошибка генерации ответа: LLM generation error: authentication failed: invalid API key

@@ -30,6 +30,17 @@ type Config struct {
 	CORSOrigin  string
 	NOMOSBase   string
 	CacheTime   time.Duration
+	
+	// LLM Configuration
+	LLMProvider string        // "external" or "ollama"
+	LLMTimeout  time.Duration
+	
+	// External Provider (OpenAI-compatible)
+	LLMBaseURL string
+	LLMAPIKey  string
+	LLMModel   string
+	
+	// Ollama (legacy, optional)
 	OllamaURL   string
 	OllamaModel string
 }
@@ -73,13 +84,32 @@ func getEnv(key, fallback string) string {
 func loadConfig() Config {
 	loadDotEnv(".env")
 
+	// Determine timeout with default
+	timeoutSec := 60
+	if envTimeout := getEnv("LLM_TIMEOUT", ""); envTimeout != "" {
+		if parsed, err := time.ParseDuration(envTimeout + "s"); err == nil {
+			timeoutSec = int(parsed.Seconds())
+		}
+	}
+
 	return Config{
 		Port:        getEnv("PORT", "3000"),
 		CORSOrigin:  getEnv("CORS_ORIGIN", "*"),
 		NOMOSBase:   strings.TrimRight(getEnv("NOMOS_BASE_URL", "https://college-nomos.ru"), "/"),
 		CacheTime:   10 * time.Minute,
+		
+		// LLM Provider configuration
+		LLMProvider: getEnv("LLM_PROVIDER", "external"),
+		LLMTimeout:  time.Duration(timeoutSec) * time.Second,
+		
+		// External provider (OpenAI-compatible)
+		LLMBaseURL: strings.TrimRight(getEnv("LLM_BASE_URL", ""), "/"),
+		LLMAPIKey:  getEnv("LLM_API_KEY", ""),
+		LLMModel:   getEnv("LLM_MODEL", ""),
+		
+		// Ollama (fallback/legacy)
 		OllamaURL:   strings.TrimRight(getEnv("OLLAMA_URL", "http://127.0.0.1:11434"), "/"),
-		OllamaModel: getEnv("OLLAMA_MODEL", "llama3.1:8b"), // LLaMA 3.1 8B for better Russian support
+		OllamaModel: getEnv("OLLAMA_MODEL", "llama3.1:8b"),
 	}
 }
 
@@ -1418,11 +1448,10 @@ func buildAnswerInstructions(question string) string {
 	b.WriteString(`Ты — Эрудит, помощник Воронежского колледжа «Номос».
 
 СТИЛЬ ОТВЕТА:
-- Отвечай КОРОТКО и СТРОГО ПО ТЕМЕ вопроса
+- Отвечай ПОЛНО и ПО СУЩЕСТВУ вопроса
 - НЕ добавляй вступления ("Привет!", "Конечно!", "Вы хотите узнать...")
 - НЕ добавляй завершения ("Чем ещё помочь?", "Есть вопросы?")
-- Просто дай конкретный ответ и всё
-- Обращайся на "вы", без местоимений "человек", "люди"
+- Обращайся на "вы"
 - Без Markdown (**, ##, ---), без URL
 - БЕЗ эмодзи (кроме офтопика)
 
@@ -1433,10 +1462,11 @@ func buildAnswerInstructions(question string) string {
 ❌ Если спросили стоимость → отвечай только про стоимость
 ✅ Читай вопрос внимательно и отвечай ТОЛЬКО на то, что спрашивают
 
-СТРУКТУРА:
-- Простой вопрос → 2-3 предложения
-- Сложный вопрос (поступление, документы) → короткий список
-- НЕ переспрашивай понятное
+ПОЛНОТА ОТВЕТА:
+- Контакты: указывай ВСЕ доступные способы связи (телефон, email, адрес)
+- Адрес: указывай ПОЛНЫЙ адрес, не ограничивайся городом
+- Стоимость: указывай сумму, период, форму обучения если есть в контексте
+- Условия: перечисляй ВСЕ важные требования и документы
 
 ОФТОПИК:
 Если вопрос НЕ про колледж → краткий ответ + возврат к теме
@@ -1444,10 +1474,34 @@ func buildAnswerInstructions(question string) string {
 
 ЯЗЫК: только русский (даже если вопрос на другом языке)
 
-РАБОТА С КОНТЕКСТОМ:
-✅ Если информация ЕСТЬ → отвечай ПРЯМО, БЕЗ "не нашёл"
+РАБОТА С КОНТЕКСТОМ — КРИТИЧЕСКИ ВАЖНО:
+✅ Используй ТОЛЬКО информацию из предоставленного контекста
+✅ Контекст содержит актуальные данные с сайта колледжа с датами загрузки
+✅ Если в контексте есть несколько значений для одного факта (например, разные цены) — НЕ выбирай произвольное
+✅ При конфликте данных укажи все варианты ИЛИ попроси уточнить у приёмной комиссии
+✅ Если информация ЕСТЬ в контексте → отвечай ПРЯМО, БЕЗ "не нашёл"
 ❌ НИКОГДА: "не нашёл информации", а потом ответ — это противоречие!
-✅ Если НЕТ информации: "Этой информации нет на сайте. Уточните в приёмной комиссии: +7 (473) 271-35-36"
+✅ Если информации НЕТ в контексте: "Этой информации нет на сайте. Уточните в приёмной комиссии: +7 (473) 271-35-36"
+
+СТОИМОСТЬ ОБУЧЕНИЯ — ОСОБЫЕ ПРАВИЛА:
+- ВСЕГДА указывай КОД специальности (54.02.01, 40.02.04 и т.д.)
+- Если указан учебный год или период — обязательно упомяни его
+- Если в контексте нет информации о форме обучения (очная/заочная) — не додумывай
+- При конфликте цен в разных документах: "Нашёл разную информацию. Уточните актуальную стоимость в приёмной комиссии: +7 (473) 271-35-36"
+
+СПЕЦИАЛЬНОСТИ:
+- "Дизайнер" / "дизайн" → специальность 54.02.01 Дизайн (по отраслям)
+- "Юрист" / "юриспруденция" → специальность 40.02.04 Юриспруденция
+- "Учитель начальных классов" / "преподавание" → 44.02.02 Преподавание в начальных классах
+- "Право и социальное обеспечение" → 40.02.01 Право и организация социального обеспечения
+- НЕ путай эти специальности между собой
+- "Дизайн интерьера" — это желаемая профессия, связанная со специальностью "Дизайн"
+
+ДАТА И АКТУАЛЬНОСТЬ:
+- Предоставленный контекст содержит дату загрузки страницы
+- Дата загрузки НЕ означает дату вступления документа в силу
+- Если в контексте указан период (например, "2024-2025 учебный год"), обязательно упомяни его
+- НЕ делай предположений об актуальности на основе даты загрузки
 
 ЧАСТИЧНАЯ ИНФОРМАЦИЯ:
 - Дай что есть БЕЗ "не нашёл"
@@ -1455,56 +1509,35 @@ func buildAnswerInstructions(question string) string {
 - Предложи контакты приёмной
 
 ДИАЛОГ:
-Короткий вопрос ("а стоимость?") → используй контекст предыдущих сообщений
-Пример:
-  User: "Какие специальности?"
-  Bot: "В колледже четыре специальности: Дизайн, Юриспруденция..."
-  User: "А стоимость дизайна?"
-  Bot: "Обучение на Дизайне (54.02.01) — 139 200 рублей в год."
-
-СТОИМОСТЬ (КРИТИЧНО):
-- 54.02.01 Дизайн = 139 200 ₽
-- 40.02.04 Юриспруденция = 80 000 ₽
-НЕ ПУТАЙ коды и цены!
-
-ОБЩЕЖИТИЕ (КРИТИЧНО):
-❌ У колледжа «Номос» НЕТ общежития
-✅ Если спросят: "У колледжа нет собственного общежития. Иногородним студентам можем помочь с поиском жилья в Воронеже."
-
-РЕЖИМ РАБОТЫ (КРИТИЧНО):
-- Понедельник-Пятница: 14:00-19:00
-- Суббота-Воскресенье: выходные
-- Телефон: +7 (473) 271-35-36
-- Адрес: г. Воронеж, ул. Пятницкого, 67
+Короткий вопрос ("а стоимость?") → используй контекст предыдущих сообщений для понимания, о чём речь
+НО: история диалога используется только для понимания вопроса
+Предыдущие ответы бота НЕ являются источником фактов — всегда проверяй по контексту
 
 ПРЕПОДАВАТЕЛИ:
 - Перечисли ФИО из контекста
 - Добавь предметы/должности если есть
 - Не придумывай
 
-ПРИМЕРЫ:
+ПРИМЕРЫ ПРАВИЛЬНЫХ ОТВЕТОВ:
 
 Q: "Какие специальности?"
 ✅ "В колледже четыре специальности:
-- 54.02.01 Дизайн
+- 54.02.01 Дизайн (по отраслям)
 - 40.02.04 Юриспруденция
 - 44.02.02 Преподавание в начальных классах
 - 40.02.01 Право и организация социального обеспечения"
 
-Q: "Кто директор?"
-✅ "Директор колледжа — Колесникова Полина Владимировна."
-
 Q: "Стоимость дизайна?"
-✅ "Обучение на специальности Дизайн (54.02.01) — 139 200 рублей в год."
+Если в контексте есть: "Обучение на специальности 54.02.01 Дизайн (по отраслям) стоит [цена из контекста] рублей в год."
+Если нет: "Актуальную стоимость обучения уточните в приёмной комиссии: +7 (473) 271-35-36"
 
-Q: "Есть ли общежитие?"
-✅ "У колледжа нет собственного общежития. Иногородним студентам можем помочь с поиском жилья в Воронеже."
+Q: "Контакты колледжа?"
+✅ Указывай ВСЕ найденные: телефон, email, адрес, часы работы
+❌ НЕ ограничивайся только телефоном
 
-Q: "Когда работает колледж?"
-✅ "Колледж работает с понедельника по пятницу с 14:00 до 19:00. Суббота и воскресенье — выходные."
-
-Q: "Как с вами связаться?"
-✅ "Телефон: +7 (473) 271-35-36. Адрес: г. Воронеж, ул. Пятницкого, 67. Режим работы: понедельник-пятница 14:00-19:00."
+Q: "Где расположен колледж?"
+✅ Укажи ПОЛНЫЙ адрес: город, улица, номер дома
+❌ НЕ ограничивайся только городом
 `)
 
 	fmt.Fprintf(&b, "\nРЕЖИМ ВОПРОСА: %s\n", mode)
@@ -1586,8 +1619,10 @@ func askOllama(ctx context.Context, cfg Config, question, contextText string, di
 	var promptBuilder strings.Builder
 	
 	// Добавляем историю диалога если есть
+	// КРИТИЧЕСКИ ВАЖНО: НЕ включаем предыдущие ответы модели (BotReply)
+	// чтобы избежать распространения ошибок через историю
 	if dialogContext != nil && len(dialogContext.History) > 0 {
-		promptBuilder.WriteString("=== ИСТОРИЯ ДИАЛОГА (последние сообщения) ===\n")
+		promptBuilder.WriteString("=== КОНТЕКСТ ДИАЛОГА (для понимания темы и follow-up вопросов) ===\n")
 		
 		// Берём последние 3 реплики
 		start := len(dialogContext.History) - 3
@@ -1597,9 +1632,10 @@ func askOllama(ctx context.Context, cfg Config, question, contextText string, di
 		
 		for i := start; i < len(dialogContext.History); i++ {
 			turn := dialogContext.History[i]
-			promptBuilder.WriteString(fmt.Sprintf("Пользователь: %s\n", turn.UserMessage))
-			if turn.BotReply != "" {
-				promptBuilder.WriteString(fmt.Sprintf("Ты ответил: %s\n", turn.BotReply))
+			// Включаем только вопросы пользователя и тему
+			promptBuilder.WriteString(fmt.Sprintf("Вопрос пользователя: %s\n", turn.UserMessage))
+			if turn.Intent.Topic != "" && turn.Intent.Topic != "general" {
+				promptBuilder.WriteString(fmt.Sprintf("Тема: %s\n", turn.Intent.Topic))
 			}
 			promptBuilder.WriteString("\n")
 		}
@@ -1608,12 +1644,13 @@ func askOllama(ctx context.Context, cfg Config, question, contextText string, di
 	}
 	
 	promptBuilder.WriteString("ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n" + question)
-	promptBuilder.WriteString("\n\n=== КОНТЕКСТ С САЙТА КОЛЛЕДЖА ===\n" + contextText)
+	promptBuilder.WriteString("\n\n=== КОНТЕКСТ С САЙТА КОЛЛЕДЖА (единственный источник фактов) ===\n" + contextText)
 	promptBuilder.WriteString("\n\n=== ТВОЯ ЗАДАЧА ===\nПрочитай контекст внимательно. Если в нём есть ответ на вопрос — отвечай ПРЯМО и УВЕРЕННО, БЕЗ фразы \"не нашёл\". Используй \"не нашёл\" ТОЛЬКО если ответа действительно нет.\n")
+	promptBuilder.WriteString("\nВСЕ ФАКТЫ (цены, даты, имена, телефоны, адреса) бери ТОЛЬКО из контекста выше. Используй контекст диалога ТОЛЬКО для понимания темы, а не как источник фактов.\n")
 	
 	// ВАЖНО: Если есть история - используй её для понимания контекста уточняющих вопросов
 	if dialogContext != nil && len(dialogContext.History) > 0 {
-		promptBuilder.WriteString("\nВНИМАНИЕ: Учитывай историю диалога выше. Если пользователь задаёт короткий уточняющий вопрос (например, 'дизайн' или 'а стоимость?'), используй контекст предыдущих сообщений для понимания, о чём именно спрашивают.\n")
+		promptBuilder.WriteString("\nВНИМАНИЕ: Если пользователь задаёт короткий уточняющий вопрос (например, 'а стоимость?' после вопроса о специальности), используй контекст диалога выше для понимания, о чём именно спрашивают. Но факты всегда проверяй в контексте с сайта колледжа.\n")
 	}
 	
 	prompt := promptBuilder.String()
@@ -1625,7 +1662,7 @@ func askOllama(ctx context.Context, cfg Config, question, contextText string, di
 		Stream:    false,
 		KeepAlive: "10m",
 		Options: map[string]any{
-			"temperature":    0.5,  // Повышено с 0.4 для более гибких и менее механических ответов
+			"temperature":    0.2,  // Снижено с 0.5 для стабильных фактических ответов (стоимость, контакты, адреса)
 			"top_p":          0.90,
 			"repeat_penalty": 1.08,
 			"num_ctx":        32768, // Увеличено с 8192 для больших документов
@@ -1735,7 +1772,7 @@ func streamOllama(ctx context.Context, cfg Config, question, contextText string,
 		Stream:    true,
 		KeepAlive: "10m",
 		Options: map[string]any{
-			"temperature":    0.5,  // Повышено с 0.4 для более гибких и менее механических ответов
+			"temperature":    0.2,  // Снижено с 0.5 для стабильных фактических ответов (стоимость, контакты, адреса)
 			"top_p":          0.90,
 			"repeat_penalty": 1.08,
 			"num_ctx":        32768,
@@ -1804,107 +1841,9 @@ func streamOllama(ctx context.Context, cfg Config, question, contextText string,
 	return scanner.Err()
 }
 
-func ensureCompleteAnswer(answer string) string {
-	answer = strings.TrimSpace(answer)
-	if answer == "" {
-		return answer
-	}
-
-	// Если модель оборвала ответ прямо на маркере списка или после двоеточия,
-	// не пытаемся дописывать факты от себя. Просто убираем явный «висящий» маркер.
-	lines := strings.Split(answer, "\n")
-	for len(lines) > 0 {
-		last := strings.TrimSpace(lines[len(lines)-1])
-		if last == "-" || last == "•" || last == "*" || strings.HasSuffix(last, ":") {
-			lines = lines[:len(lines)-1]
-			continue
-		}
-		break
-	}
-
-	answer = strings.TrimSpace(strings.Join(lines, "\n"))
-	return answer
-}
-
-func cleanLLMAnswer(answer string) string {
-	answer = strings.TrimSpace(answer)
-
-	// ---------------------------------------------------------
-	// Убираем служебную обёртку, которую иногда добавляет модель.
-	// Например:
-	// «Вот отредактированный и законченный ответ пользователю... »
-	// ---------------------------------------------------------
-	introPatterns := []*regexp.Regexp{
-		regexp.MustCompile(`(?is)^\s*вот\s+отредактированный\s+и\s+законченный\s+ответ\s+пользователю\s+с\s+учетом\s+предоставленного\s+текста\s*:?\s*`),
-		regexp.MustCompile(`(?is)^\s*вот\s+(?:обновл(?:е|ё)нн(?:ая|ую)|исправленн(?:ая|ую)|готов(?:ая|ый))\s+(?:версия\s+текста|текст|ответ)(?:\s+пользователю)?\s*(?:с\s+исправлением[^:]*|с\s+учетом[^:]*|для\s+пользователя[^:]*)?:?\s*`),
-		regexp.MustCompile(`(?is)^\s*вот\s+готовый\s+ответ\s+пользователю\s*:?\s*`),
-		regexp.MustCompile(`(?is)^\s*вот\s+готовый\s+вариант\s+ответа(?:\s+пользователю)?\s*:?\s*`),
-		regexp.MustCompile(`(?is)^\s*вот\s+обновл(?:е|ё)нн(?:ая|ую)\s+версия[^:]*:?\s*`),
-		regexp.MustCompile(`(?is)^\s*вот\s+исправленн(?:ая|ую)\s+версия[^:]*:?\s*`),
-		regexp.MustCompile(`(?is)^\s*вот\s+ответ\s*:?\s*`),
-	}
-
-	for _, re := range introPatterns {
-		answer = re.ReplaceAllString(answer, "")
-	}
-
-	// Убираем markdown-обёртки и служебные заголовки.
-	answer = regexp.MustCompile(`(?m)^\s*---\s*$`).ReplaceAllString(answer, "")
-	answer = regexp.MustCompile("(?s)```(?:markdown|md|text)?\\s*(.*?)```").ReplaceAllString(answer, "$1")
-
-	lines := strings.Split(answer, "\n")
-	filtered := make([]string, 0, len(lines))
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Не показываем markdown-заголовки вроде:
-		// ### Новости
-		// #### Страница 7
-		if regexp.MustCompile(`^#{1,6}\s*`).MatchString(trimmed) {
-			// Не показываем сгенерированные моделью markdown-заголовки:
-			// ### Новости, #### Страница 7 и любые другие heading-строки.
-			continue
-		}
-
-		// Убираем отдельные служебные строки даже без символов #.
-		if strings.EqualFold(trimmed, "новости") ||
-			regexp.MustCompile(`(?i)^страница\s+\d+$`).MatchString(trimmed) {
-			continue
-		}
-
-		filtered = append(filtered, line)
-	}
-
-	answer = strings.Join(filtered, "\n")
-
-	// ---------------------------------------------------------
-	// Убираем источники и URL из пользовательского ответа.
-	// ---------------------------------------------------------
-	urlRE := regexp.MustCompile(`https?://[^\s)]+`)
-	answer = urlRE.ReplaceAllString(answer, "")
-	answer = regexp.MustCompile(`(?im)^\s*источник(?:и)?\s*:?.*$`).ReplaceAllString(answer, "")
-
-	// ---------------------------------------------------------
-	// Убираем markdown-жирность:
-	// **25.06.2025** -> 25.06.2025
-	// **Дизайн** -> Дизайн
-	// ---------------------------------------------------------
-	answer = strings.ReplaceAll(answer, "**", "")
-
-	// Убираем одинокие обратные markdown-кавычки, если модель
-	// случайно использовала их как оформление.
-	answer = strings.ReplaceAll(answer, "`", "")
-
-	lines = strings.Split(answer, "\n")
-	clean := make([]string, 0, len(lines))
-	for _, line := range lines {
-		line = strings.TrimRight(line, " \t")
-		clean = append(clean, line)
-	}
-
-	answer = strings.TrimSpace(strings.Join(clean, "\n"))
-	return answer
-}
+// =========================================================
+// LLM HELPER FUNCTIONS (moved to llm_provider.go)
+// =========================================================
 
 // =========================================================
 // FALLBACK WITHOUT OLLAMA
@@ -2035,6 +1974,7 @@ type Server struct {
 	Config         Config
 	Sources        []Source
 	SessionManager *SessionManager
+	LLMProvider    LLMProvider // Injected LLM provider
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -2106,7 +2046,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Используем новый механизм обработки с контекстом сессии
-	answer, sources, fragmentIDs, err := GenerateAnswer(r.Context(), s.Config, question, &dialogContext)
+	answer, sources, fragmentIDs, err := GenerateAnswer(r.Context(), s.Config, s.LLMProvider, question, &dialogContext)
 	if err != nil {
 		log.Printf("Ошибка генерации ответа: %v", err)
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("Ошибка: %v", err))
@@ -2117,10 +2057,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.SessionManager.UpdateContext(sessionID, dialogContext)
 
 	// Сохраняем в кэш ТОЛЬКО успешные ответы с fragmentIDs
+	// КРИТИЧЕСКИ ВАЖНО: fragmentIDs == nil для unverified answers (см. GenerateAnswer)
 	if globalCacheManager != nil && err == nil && len(fragmentIDs) > 0 {
+		log.Printf("CACHE: Saving verified answer (fragmentIDs=%v)", fragmentIDs)
 		if err := globalCacheManager.Put(cacheKey, answer, sources, fragmentIDs); err != nil {
 			log.Printf("Cache save error: %v", err)
 		}
+	} else if len(fragmentIDs) == 0 {
+		log.Printf("CACHE: NOT saving (answer not verified or no evidence)")
 	}
 
 	writeJSON(w, http.StatusOK, chatResponse{
@@ -2213,7 +2157,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	var streamFragmentIDs []int64
 	var streamError error
 	
-	streamError = StreamAnswer(r.Context(), s.Config, question, &dialogContext, 
+	streamError = StreamAnswer(r.Context(), s.Config, s.LLMProvider, question, &dialogContext, 
 		func(chunk string) error {
 			collectedAnswer.WriteString(chunk)
 			fmt.Fprintf(w, "data: %s\n\n", jsonEscape(chunk))
@@ -2280,7 +2224,7 @@ func streamFromOllama(ctx context.Context, cfg Config, question, contextText str
 		Stream:    true,
 		KeepAlive: "10m",
 		Options: map[string]any{
-			"temperature":    0.5,  // Повышено с 0.4 для более гибких и менее механических ответов
+			"temperature":    0.2,  // Снижено с 0.5 для стабильных фактических ответов (стоимость, контакты, адреса)
 			"top_p":          0.90,
 			"repeat_penalty": 1.08,
 			"num_ctx":        32768,
@@ -2693,12 +2637,19 @@ func main() {
 		
 		globalCacheManager = NewCacheManager(db)
 		
+		// Инициализация LLM Provider для CLI режима
+		var llmProvider LLMProvider
+		if cfg.LLMProvider == "external" {
+			if cfg.LLMBaseURL == "" || cfg.LLMAPIKey == "" || cfg.LLMModel == "" {
+				log.Fatalf("LLM_PROVIDER=external requires LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL")
+			}
+			llmProvider = NewExternalProvider(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, cfg.LLMTimeout)
+		} else {
+			llmProvider = NewOllamaProvider(cfg.OllamaURL, cfg.OllamaModel, cfg.LLMTimeout)
+		}
+		
 		// Получаем ответ
-		answer, sources, _, err := GenerateAnswer(context.Background(), Config{
-			NOMOSBase:   cfg.NOMOSBase,
-			OllamaURL:   cfg.OllamaURL,
-			OllamaModel: cfg.OllamaModel,
-		}, question, nil)
+		answer, sources, _, err := GenerateAnswer(context.Background(), cfg, llmProvider, question, nil)
 		if err != nil {
 			log.Fatalf("Ошибка получения ответа: %v", err)
 		}
@@ -2744,11 +2695,27 @@ func main() {
 	// Инициализация менеджера сессий
 	sessionManager := NewSessionManager()
 	log.Printf("Session manager initialized")
+	
+	// Инициализация LLM Provider
+	var llmProvider LLMProvider
+	if cfg.LLMProvider == "external" {
+		if cfg.LLMBaseURL == "" || cfg.LLMAPIKey == "" || cfg.LLMModel == "" {
+			log.Fatalf("LLM_PROVIDER=external requires LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL")
+		}
+		llmProvider = NewExternalProvider(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, cfg.LLMTimeout)
+		log.Printf("LLM Provider: external (OpenAI-compatible)")
+	} else if cfg.LLMProvider == "ollama" {
+		llmProvider = NewOllamaProvider(cfg.OllamaURL, cfg.OllamaModel, cfg.LLMTimeout)
+		log.Printf("LLM Provider: ollama")
+	} else {
+		log.Fatalf("Unknown LLM_PROVIDER: %s (supported: external, ollama)", cfg.LLMProvider)
+	}
 
 	server := &Server{
 		Config:         cfg,
 		Sources:        sources,
 		SessionManager: sessionManager,
+		LLMProvider:    llmProvider,
 	}
 
 	mux := http.NewServeMux()
@@ -2770,12 +2737,30 @@ func main() {
 	log.Println("========================================")
 	log.Printf("Erudit backend running on :%s", cfg.Port)
 	log.Printf("NOMOS: %s", cfg.NOMOSBase)
-	log.Printf("Ollama: %s", cfg.OllamaURL)
-	if cfg.OllamaModel == "" {
-		log.Println("Ollama model: auto (первая установленная модель)")
-	} else {
-		log.Printf("Ollama model: %s", cfg.OllamaModel)
+	
+	// LLM Provider startup diagnostics
+	log.Printf("LLM PROVIDER: %s", cfg.LLMProvider)
+	log.Printf("LLM TIMEOUT: %s", cfg.LLMTimeout)
+	if cfg.LLMProvider == "external" {
+		if cfg.LLMBaseURL != "" {
+			log.Printf("LLM BASE URL: %s", cfg.LLMBaseURL)
+		} else {
+			log.Printf("LLM BASE URL: NOT CONFIGURED")
+		}
+		if cfg.LLMModel != "" {
+			log.Printf("LLM MODEL: %s", cfg.LLMModel)
+		} else {
+			log.Printf("LLM MODEL: NOT CONFIGURED")
+		}
+	} else if cfg.LLMProvider == "ollama" {
+		log.Printf("Ollama: %s", cfg.OllamaURL)
+		if cfg.OllamaModel == "" {
+			log.Println("Ollama model: auto (первая установленная модель)")
+		} else {
+			log.Printf("Ollama model: %s", cfg.OllamaModel)
+		}
 	}
+	
 	log.Printf("Widget: http://localhost:%s/widget/chat.html", cfg.Port)
 	log.Printf("Chat API: http://localhost:%s/api/chat", cfg.Port)
 	log.Println("========================================")

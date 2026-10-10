@@ -1,6 +1,7 @@
 ﻿package main
 
 import (
+	"fmt"
 	"log"
 	"regexp"
 	"strings"
@@ -271,6 +272,53 @@ func extractAnaphora(q string) []string {
 	return anaphora
 }
 
+// isEntityRelevantToQuestion проверяет, релевантна ли entity из контекста к новому вопросу
+func isEntityRelevantToQuestion(entityType, entityValue, question string) bool {
+	q := normalize(question)
+	
+	// Если в вопросе явно упоминается другая entity того же типа - старая не релевантна
+	switch entityType {
+	case "specialty":
+		// Если в вопросе есть название другой специальности - не используем старую
+		otherSpecialties := []string{
+			"юриспруденц", "право", "дизайн", "преподавание", "начальн",
+			"музык", "информатик", "программирован", "экономик", "бухгалтер",
+		}
+		normalizedEntity := normalize(entityValue)
+		for _, spec := range otherSpecialties {
+			// Если в вопросе есть специальность, но она отличается от контекстной - НЕ релевантна
+			if strings.Contains(q, spec) && !strings.Contains(normalizedEntity, spec) {
+				log.Printf("ENTITY_RELEVANCE: specialty='%s' NOT relevant - question mentions '%s'", entityValue, spec)
+				return false
+			}
+		}
+		
+		// Если вопрос общий (не про специальность) - не используем specialty
+		generalQuestions := []string{
+			"где находится", "как добраться", "адрес колледж", "телефон колледж",
+			"директор", "руководител", "когда открыт", "режим работ",
+			"общежитие", "документы для поступления", "как поступить",
+		}
+		for _, pattern := range generalQuestions {
+			if strings.Contains(q, pattern) {
+				log.Printf("ENTITY_RELEVANCE: specialty='%s' NOT relevant - general question", entityValue)
+				return false
+			}
+		}
+		
+	case "teacher_name":
+		// Если в вопросе упоминается другое ФИО - старое не релевантно
+		// Простая эвристика: если в вопросе есть другие имена/фамилии
+		if containsAny(q, "кто", "какой преподаватель", "список преподавателей") {
+			log.Printf("ENTITY_RELEVANCE: teacher='%s' NOT relevant - asking about teachers in general", entityValue)
+			return false
+		}
+	}
+	
+	// По умолчанию считаем релевантным (консервативный подход)
+	return true
+}
+
 // resolveAnaphora разрешает ссылки на предыдущий контекст
 func resolveAnaphora(intent *Intent, context *DialogContext) {
 	q := normalize(intent.Question)
@@ -296,9 +344,6 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 			// Восстанавливаем исходный вопрос и добавляем уточнение
 			if context.ExpectedParameter == "specialty" {
 				// Пользователь ответил названием специальности
-				// Формируем полный вопрос: исходный + уточнение
-				intent.Question = context.PendingQuestion + " по специальности " + q
-				
 				// Извлекаем специальность из ответа пользователя
 				extractEntities(q, intent, context)
 				
@@ -315,6 +360,29 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 						}
 					}
 				}
+				
+				// Формируем ЧИСТЫЙ вопрос для поиска на основе темы и сущностей
+				// Убираем приветствия из исходного вопроса
+				cleanOriginal := strings.TrimSpace(context.PendingQuestion)
+				cleanOriginal = strings.TrimPrefix(cleanOriginal, "привет")
+				cleanOriginal = strings.TrimPrefix(cleanOriginal, "здравствуйте")
+				cleanOriginal = strings.TrimPrefix(cleanOriginal, "добрый день")
+				cleanOriginal = strings.TrimPrefix(cleanOriginal, "hi")
+				cleanOriginal = strings.TrimPrefix(cleanOriginal, "hello")
+				cleanOriginal = strings.TrimLeft(cleanOriginal, ", ")
+				cleanOriginal = strings.TrimSpace(cleanOriginal)
+				
+				// Формируем естественный вопрос с указанием специальности
+				if spec, ok := intent.Entities["specialty"]; ok {
+					intent.Question = fmt.Sprintf("%s по специальности %s", cleanOriginal, spec)
+				} else {
+					intent.Question = cleanOriginal + " " + q
+				}
+				
+				// КРИТИЧЕСКИ ВАЖНО: После восстановления контекста меняем тип на "question"
+				// чтобы система обработала это как полноценный вопрос, а не просто уточнение
+				intent.Type = "question"
+				log.Printf("CLARIFICATION: changed type to 'question' after context restoration")
 			} else if context.ExpectedParameter == "group" {
 				intent.Question = context.PendingQuestion + " для группы " + q
 			} else {
@@ -344,11 +412,19 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 	
 	lastTurn := context.History[len(context.History)-1]
 	
-	// Копируем сущности из предыдущего контекста
+	// Копируем сущности из предыдущего контекста с проверкой релевантности
 	log.Printf("RESOLVE_ANAPHORA: before copy - intent.Entities=%v context.LastEntities=%v", intent.Entities, context.LastEntities)
+	
+	// КРИТИЧЕСКИ ВАЖНО: Проверяем релевантность entity перед копированием
 	for k, v := range context.LastEntities {
 		if _, exists := intent.Entities[k]; !exists {
-			intent.Entities[k] = v
+			// Проверяем, релевантна ли entity к новому вопросу
+			if isEntityRelevantToQuestion(k, v, intent.Question) {
+				intent.Entities[k] = v
+				log.Printf("RESOLVE_ANAPHORA: copied entity %s='%s' (relevant)", k, v)
+			} else {
+				log.Printf("RESOLVE_ANAPHORA: skipped entity %s='%s' (NOT relevant to new question)", k, v)
+			}
 		}
 	}
 	log.Printf("RESOLVE_ANAPHORA: after copy - intent.Entities=%v", intent.Entities)

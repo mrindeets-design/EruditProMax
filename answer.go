@@ -8,11 +8,52 @@ import (
 	"time"
 )
 
+// buildUserPrompt создаёт user prompt с историей диалога и контекстом
+func buildUserPrompt(question, contextText string, dialogContext *DialogContext) string {
+	var promptBuilder strings.Builder
+	
+	// Добавляем историю диалога если есть
+	// КРИТИЧЕСКИ ВАЖНО: НЕ включаем предыдущие ответы модели (BotReply)
+	// чтобы избежать распространения ошибок через историю
+	if dialogContext != nil && len(dialogContext.History) > 0 {
+		promptBuilder.WriteString("=== КОНТЕКСТ ДИАЛОГА (для понимания темы и follow-up вопросов) ===\n")
+		
+		// Берём последние 3 реплики
+		start := len(dialogContext.History) - 3
+		if start < 0 {
+			start = 0
+		}
+		
+		for i := start; i < len(dialogContext.History); i++ {
+			turn := dialogContext.History[i]
+			// Включаем только вопросы пользователя и тему
+			promptBuilder.WriteString(fmt.Sprintf("Вопрос пользователя: %s\n", turn.UserMessage))
+			if turn.Intent.Topic != "" && turn.Intent.Topic != "general" {
+				promptBuilder.WriteString(fmt.Sprintf("Тема: %s\n", turn.Intent.Topic))
+			}
+			promptBuilder.WriteString("\n")
+		}
+		
+		promptBuilder.WriteString("=== ТЕКУЩИЙ ВОПРОС ===\n")
+	}
+	
+	promptBuilder.WriteString("ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n" + question)
+	promptBuilder.WriteString("\n\n=== КОНТЕКСТ С САЙТА КОЛЛЕДЖА (единственный источник фактов) ===\n" + contextText)
+	promptBuilder.WriteString("\n\n=== ТВОЯ ЗАДАЧА ===\nПрочитай контекст внимательно. Если в нём есть ответ на вопрос — отвечай ПРЯМО и УВЕРЕННО, БЕЗ фразы \"не нашёл\". Используй \"не нашёл\" ТОЛЬКО если ответа действительно нет.\n")
+	promptBuilder.WriteString("\nВСЕ ФАКТЫ (цены, даты, имена, телефоны, адреса) бери ТОЛЬКО из контекста выше. Используй контекст диалога ТОЛЬКО для понимания темы, а не как источник фактов.\n")
+	
+	// ВАЖНО: Если есть история - используй её для понимания контекста уточняющих вопросов
+	if dialogContext != nil && len(dialogContext.History) > 0 {
+		promptBuilder.WriteString("\nВНИМАНИЕ: Если пользователь задаёт короткий уточняющий вопрос (например, 'а стоимость?' после вопроса о специальности), используй контекст диалога выше для понимания, о чём именно спрашивают. Но факты всегда проверяй в контексте с сайта колледжа.\n")
+	}
+	
+	return promptBuilder.String()
+}
+
 // =========================================================
-// ANSWER GENERATION
+// ANSWER CONTEXT
 // =========================================================
 
-// answerContext содержит результат подготовки контекста для ответа
 type answerContext struct {
 	Intent        Intent
 	ContextText   string
@@ -21,6 +62,11 @@ type answerContext struct {
 	DirectReply   string  // Для приветствий и уточнений
 	ShouldGenerate bool   // false если есть DirectReply
 }
+
+// =========================================================
+// ANSWER GENERATION
+// =========================================================
+
 
 // prepareAnswerContext выполняет общую логику подготовки: понимание намерения, поиск материалов
 // Возвращает либо готовый ответ (уточнение/приветствие), либо контекст для генерации
@@ -63,7 +109,7 @@ func prepareAnswerContext(ctx context.Context, cfg Config, question string, dial
 	if intent.Type == "greeting" {
 		return &answerContext{
 			Intent:         intent,
-			DirectReply:    "Здравствуйте! Я Эрудит — помощник Воронежского колледжа «Номос». Могу рассказать о поступлении, специальностях, стоимости обучения, преподавателях и других вопросах. Чем могу помочь?",
+			DirectReply:    "Здравствуйте! Я Эрудит — помощник Воронежского колледжа «Номос». Чем могу помочь?",
 			ShouldGenerate: false,
 		}, nil
 	}
@@ -178,7 +224,7 @@ func finalizeDialogTurn(question, answer string, intent Intent, sources []Source
 }
 
 // GenerateAnswer формирует ответ на вопрос (без streaming)
-func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogContext *DialogContext) (string, []Source, []int64, error) {
+func GenerateAnswer(ctx context.Context, cfg Config, llmProvider LLMProvider, question string, dialogContext *DialogContext) (string, []Source, []int64, error) {
 	startTime := time.Now()
 	log.Printf("GenerateAnswer: START")
 	
@@ -200,15 +246,60 @@ func GenerateAnswer(ctx context.Context, cfg Config, question string, dialogCont
 		return ansCtx.DirectReply, ansCtx.Sources, nil, nil
 	}
 	
-	// Генерация ответа через Ollama
-	log.Printf("GenerateAnswer: Before AskOllama")
-	answer, err := askOllama(ctx, cfg, question, ansCtx.ContextText, dialogContext)
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("ошибка Ollama: %w", err)
+	// Генерация ответа через LLM Provider
+	log.Printf("GenerateAnswer: Before LLM generation")
+	// ВАЖНО: Используем intent.Question, который содержит восстановленный полный вопрос
+	// (например, "стоимость обучения по специальности дизайн" вместо "дизайн интересует")
+	questionForLLM := ansCtx.Intent.Question
+	if questionForLLM == "" {
+		questionForLLM = question // fallback на исходный вопрос
 	}
-	log.Printf("GenerateAnswer: After AskOllama, answer length: %d", len(answer))
+	log.Printf("QUESTION TO LLM: original='%s' intent='%s' using='%s'", question, ansCtx.Intent.Question, questionForLLM)
 	
-	// Обновляем историю диалога
+	// Формируем промпт (используем существующую логику)
+	systemPrompt := buildAnswerInstructions(questionForLLM)
+	userPrompt := buildUserPrompt(questionForLLM, ansCtx.ContextText, dialogContext)
+	
+	llmReq := LLMRequest{
+		SystemPrompt: systemPrompt,
+		UserPrompt:   userPrompt,
+		Temperature:  0.2,
+		MaxTokens:    predictionLimit(questionForLLM),
+	}
+	
+	llmResp, err := llmProvider.Generate(ctx, llmReq)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("LLM generation error: %w", err)
+	}
+	
+	answer := cleanLLMAnswer(llmResp.Content)
+	answer = ensureCompleteAnswer(answer)
+	
+	log.Printf("GenerateAnswer: After LLM generation, answer length: %d", len(answer))
+	
+	// КРИТИЧЕСКИ ВАЖНО: Проверяем ответ против evidence перед возвратом
+	verification := verifyAnswer(answer, ansCtx.ContextText, ansCtx.Sources)
+	
+	if !verification.Passed {
+		// Ответ содержит неподтверждённые утверждения
+		log.Printf("VERIFICATION FAILED: %d unsupported claims", len(verification.UnsupportedClaims))
+		
+		// Формируем безопасный ответ
+		safeAnswer := "К сожалению, я не могу дать точный ответ на основе доступной информации. "
+		safeAnswer += "Пожалуйста, уточните вопрос в приёмной комиссии колледжа по телефону +7 (473) 271-35-36."
+		
+		// НЕ сохраняем неверифицированный ответ в историю
+		// НЕ возвращаем fragmentIDs (чтобы не закешировать)
+		
+		elapsed := time.Since(startTime)
+		log.Printf("ANSWER REJECTED: %v", elapsed)
+		
+		return safeAnswer, ansCtx.Sources, nil, nil
+	}
+	
+	log.Printf("VERIFICATION PASSED: answer is safe")
+	
+	// Обновляем историю диалога ТОЛЬКО с проверенным ответом
 	finalizeDialogTurn(question, answer, ansCtx.Intent, ansCtx.Sources, dialogContext)
 	
 	elapsed := time.Since(startTime)
@@ -255,7 +346,7 @@ func buildContextFromResults(results []SearchResult, maxFragments int) (string, 
 }
 
 // StreamAnswer генерирует ответ с поддержкой streaming
-func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContext *DialogContext, onChunk func(string) error, onSources func([]Source) error, onFragmentIDs func([]int64) error) error {
+func StreamAnswer(ctx context.Context, cfg Config, llmProvider LLMProvider, question string, dialogContext *DialogContext, onChunk func(string) error, onSources func([]Source) error, onFragmentIDs func([]int64) error) error {
 	startTime := time.Now()
 	log.Printf("StreamAnswer: START")
 	
@@ -304,11 +395,28 @@ func StreamAnswer(ctx context.Context, cfg Config, question string, dialogContex
 		return onChunk(chunk)
 	}
 	
-	// Streaming запрос к Ollama
-	log.Printf("StreamAnswer: Before streamOllama")
-	err = streamOllama(ctx, cfg, question, ansCtx.ContextText, dialogContext, wrappedOnChunk)
+	// ВАЖНО: Используем intent.Question, который содержит восстановленный полный вопрос
+	questionForLLM := ansCtx.Intent.Question
+	if questionForLLM == "" {
+		questionForLLM = question
+	}
+	
+	// Формируем промпт
+	systemPrompt := buildAnswerInstructions(questionForLLM)
+	userPrompt := buildUserPrompt(questionForLLM, ansCtx.ContextText, dialogContext)
+	
+	llmReq := LLMRequest{
+		SystemPrompt: systemPrompt,
+		UserPrompt:   userPrompt,
+		Temperature:  0.2,
+		MaxTokens:    predictionLimit(questionForLLM),
+	}
+	
+	// Streaming запрос к LLM Provider
+	log.Printf("StreamAnswer: Before LLM streaming")
+	err = llmProvider.Stream(ctx, llmReq, wrappedOnChunk)
 	if err != nil {
-		log.Printf("StreamAnswer: streamOllama error: %v", err)
+		log.Printf("StreamAnswer: LLM stream error: %v", err)
 		return err
 	}
 	

@@ -1,0 +1,50 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"log"
+	"strings"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+func main() {
+	db, err := sql.Open("sqlite3", "erudit.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// Ищем фрагменты со словом "рубл" и "дизайн" или "54.02.01"
+	query := `
+		SELECT source, substr(text, 1, 500) as preview 
+		FROM fragments 
+		WHERE (text LIKE '%рубл%' OR text LIKE '%рубл%') 
+		  AND (text LIKE '%дизайн%' OR text LIKE '%54.02.01%')
+		LIMIT 10
+	`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+
+	fmt.Println("=== Фрагменты с ценами для дизайна ===\n")
+	count := 0
+	for rows.Next() {
+		var source, preview string
+		if err := rows.Scan(&source, &preview); err != nil {
+			log.Fatal(err)
+		}
+		count++
+		fmt.Printf("--- Фрагмент %d ---\n", count)
+		fmt.Printf("Источник: %s\n", source)
+		fmt.Printf("Текст: %s\n\n", strings.ReplaceAll(preview, "\n", " "))
+	}
+
+	if count == 0 {
+		fmt.Println("Не найдено фрагментов с информацией о стоимости!")
+	}
+}
