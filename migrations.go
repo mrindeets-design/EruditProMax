@@ -13,7 +13,7 @@ import (
 // DATABASE SCHEMA & MIGRATIONS
 // =========================================================
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // InitDatabase создаёт или мигрирует схему БД
 func InitDatabase(dbPath string) (*sql.DB, error) {
@@ -123,6 +123,7 @@ func runMigrations(db *sql.DB, fromVersion int) error {
 	}{
 		{1, "initial_schema", migrationV1Part1 + migrationV1Part2 + migrationV1Part3},
 		{2, "add_fts5_and_embeddings", migrationV2},
+		{3, "enriched_fragment_metadata", migrationV3},
 	}
 
 	for _, m := range migrations {

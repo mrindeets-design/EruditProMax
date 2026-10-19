@@ -242,18 +242,20 @@
         );
 
 
-        if (!response.ok) {
-
-            throw new Error(
-                "HTTP " +
-                response.status
-            );
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (error) {
+            if (!response.ok) {
+                throw new Error("HTTP " + response.status);
+            }
+            throw new Error("Сервер вернул некорректный ответ.");
         }
 
-
-        const data =
-            await response.json();
-
+        if (!response.ok) {
+            throw new Error(data.error || "HTTP " + response.status);
+        }
 
         console.log("📥 Ответ backend:", data);
         console.log("📥 JSON backend:", JSON.stringify(data, null, 2));
@@ -337,10 +339,10 @@
             hideTyping();
 
 
-            addMessage(
-                "Я получил ваш вопрос, но сейчас не удалось получить ответ от сервера.",
-                "bot"
-            );
+            const errorMessage = error && error.message
+                ? "Не удалось получить ответ: " + error.message
+                : "Не удалось получить ответ от сервера.";
+            addMessage(errorMessage, "bot");
         } finally {
             // Восстанавливаем управление
             input.disabled = false;

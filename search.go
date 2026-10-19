@@ -147,6 +147,9 @@ func SearchMaterials(ctx context.Context, cfg Config, queries []SearchQuery) ([]
 
 // SearchMaterialsWithContext ищет релевантные материалы с учетом контекста диалога
 func SearchMaterialsWithContext(ctx context.Context, cfg Config, queries []SearchQuery, dialogContext *DialogContext) ([]SearchResult, error) {
+	// РЕФАКТОРИНГ: Определяем минимальный порог релевантности
+	const minRelevanceThreshold = 0.3
+	
 	allResults := []SearchResult{}
 	
 	for _, query := range queries {
@@ -164,13 +167,29 @@ func SearchMaterialsWithContext(ctx context.Context, cfg Config, queries []Searc
 		}
 		
 		results := extractRelevantFragmentsWithContext(query, pages, dialogContext)
-		allResults = append(allResults, results...)
+		
+		// РЕФАКТОРИНГ: Фильтруем по порогу релевантности
+		for _, result := range results {
+			if result.Relevance >= minRelevanceThreshold {
+				allResults = append(allResults, result)
+			} else {
+				log.Printf("🚫 FILTERED: relevance=%.3f < threshold=%.3f", result.Relevance, minRelevanceThreshold)
+			}
+		}
 	}
 	
 	allResults = deduplicateResults(allResults)
 	sort.Slice(allResults, func(i, j int) bool {
 		return allResults[i].Relevance > allResults[j].Relevance
 	})
+	
+	// РЕФАКТОРИНГ: Жёсткое ограничение Top-K (максимум 5 фрагментов)
+	maxResults := 5
+	if len(allResults) > maxResults {
+		allResults = allResults[:maxResults]
+	}
+	
+	log.Printf("✂️ SEARCH RESULTS LIMITED: %d results (top-%d, threshold=%.2f)", len(allResults), maxResults, minRelevanceThreshold)
 	
 	return allResults, nil
 }
@@ -699,83 +718,6 @@ func calculateRelevanceWithContext(query SearchQuery, fragment string, dialogCon
 	return score
 }
 
-// extractKeywords извлекает ключевые слова из вопроса
-func extractKeywords(question string) []string {
-	q := normalize(question)
-	
-	stopWords := []string{
-		"как", "что", "где", "когда", "почему", "какой", "какая", "какие",
-		"кто", "сколько", "чего", "можно", "нужно", "есть", "быть",
-		"это", "этот", "эта", "эти", "мне", "меня", "вас", "вам", "для", "или", "на", "по", "из", "от", "до", "под",
-	}
-	
-	words := strings.Fields(q)
-	keywords := []string{}
-	
-	log.Printf("EXTRACT_KEYWORDS: question='%s' len=%d, normalized='%s' len=%d, words=%d", question, len(question), q, len(q), len(words))
-	
-	for _, word := range words {
-		if len(word) < 3 {
-			continue
-		}
-		
-		isStopWord := false
-		for _, sw := range stopWords {
-			if word == sw {
-				isStopWord = true
-				break
-			}
-		}
-		
-		if !isStopWord {
-			keywords = append(keywords, word)
-		}
-	}
-	
-	log.Printf("EXTRACT_KEYWORDS: result=%v (from %d words)", keywords, len(words))
-	
-	return keywords
-}
-
-
-// getTopicKeywords возвращает ключевые слова для темы
-func getTopicKeywords(topic string) []string {
-	topicKW := map[string][]string{
-		"admission": {"поступ", "абитур", "прием", "зачисл", "экзамен", "документ"},
-		"payment":   {"стоимость", "цена", "оплат", "рубл", "бюджет", "контракт"},
-		"practice":  {"практик", "стажировк"},
-		"schedule":  {"расписан", "график", "занят"},
-		"contacts":  {"контакт", "телефон", "адрес", "email"},
-		"staff":     {"преподава", "директор", "завуч", "педагог", "учитель"},  // Используем корни
-		"specialty": {"специальность", "направлен", "профес"},
-		"news":      {"новост", "событ", "мероприят"},
-	}
-	
-	if kw, ok := topicKW[topic]; ok {
-		return kw
-	}
-	return []string{}
-}
-
-// deduplicateResults удаляет дубликаты
-func deduplicateResults(results []SearchResult) []SearchResult {
-	seen := make(map[string]bool)
-	unique := []SearchResult{}
-	
-	for _, r := range results {
-		key := r.Fragment
-		if len(key) > 100 {
-			key = key[:100]
-		}
-		
-		if !seen[key] {
-			seen[key] = true
-			unique = append(unique, r)
-		}
-	}
-	
-	return unique
-}
 
 // CheckSufficiency проверяет достаточность результатов
 func CheckSufficiency(query SearchQuery, results []SearchResult) bool {

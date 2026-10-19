@@ -1,170 +1,128 @@
-# Инструкции по проверке унификации
+# Тест новой системы индексации с обогащёнными метаданными
 
-## Быстрая проверка
+## Команды для тестирования
 
-### 1. Компиляция
+### 1. Проверка текущей версии схемы
 ```bash
-cd c:\Users\Drago\Downloads\erudit
-go build -o erudit.exe
+sqlite3 erudit.db "SELECT * FROM schema_migrations ORDER BY version DESC LIMIT 1;"
 ```
 
-### 2. Модульные тесты
+### 2. Проверка новых полей в fragments
 ```bash
-go test -v -run TestPrepareAnswerContext
-go test -v -run TestFinalizeDialogTurn
-go test -v -run TestClarificationStateConsistency
+sqlite3 erudit.db "PRAGMA table_info(fragments);"
 ```
 
-**Ожидаемый результат:** Все 3 теста PASS
-
-## Интеграционное тестирование с Ollama
-
-### Подготовка
+### 3. Запуск индексации (небольшая выборка для теста)
 ```bash
-# Запустить Ollama
-ollama serve
-
-# В другом терминале запустить сервер
-.\erudit.exe
+./erudit.exe -crawl
 ```
 
-### Сценарий 1: Приветствие (обычный режим)
-```bash
-curl -X POST http://localhost:8080/api/chat `
-  -H "Content-Type: application/json" `
-  -d '{\"message\": \"Здравствуйте\", \"session_id\": \"test1\"}'
+### 4. Проверка обогащённых фрагментов
+```sql
+-- Проверить фрагменты с заполненными метаданными
+SELECT 
+    id,
+    page_id,
+    chunk_index,
+    section_title,
+    parent_titles,
+    content_type,
+    specialty_code,
+    academic_year,
+    substr(text, 1, 100) as preview
+FROM fragments 
+WHERE section_title IS NOT NULL
+ORDER BY id DESC 
+LIMIT 10;
 ```
 
-**Проверка:**
-- Ответ содержит "Я Эрудит"
-- В логах: `DIALOG: turn added, history size=1, topic=`
-
-### Сценарий 2: Приветствие (streaming)
-```bash
-curl -N -X POST http://localhost:8080/api/chat/stream `
-  -H "Content-Type: application/json" `
-  -d '{\"message\": \"Здравствуйте\", \"session_id\": \"test2\"}'
+### 5. Статистика по типам контента
+```sql
+SELECT 
+    content_type, 
+    COUNT(*) as count,
+    AVG(length(text)) as avg_length
+FROM fragments 
+WHERE content_type IS NOT NULL
+GROUP BY content_type;
 ```
 
-**Проверка:**
-- Поток событий: `event: session`, затем `data:` chunks, затем `data: [DONE]`
-- В логах: `DIALOG: turn added, history size=1, topic=`
-
-### Сценарий 3: Уточнение + ответ (обычный режим)
-```bash
-# Шаг 1: Запрос уточнения
-curl -X POST http://localhost:8080/api/chat `
-  -H "Content-Type: application/json" `
-  -d '{\"message\": \"Какая стоимость обучения?\", \"session_id\": \"test3\"}'
+### 6. Статистика по специальностям
+```sql
+SELECT 
+    specialty_code,
+    COUNT(*) as fragment_count,
+    COUNT(DISTINCT page_id) as page_count
+FROM fragments 
+WHERE specialty_code IS NOT NULL
+GROUP BY specialty_code
+ORDER BY fragment_count DESC;
 ```
 
-**Проверка:**
-- Ответ содержит "о какой специальности"
-- В логах: `ASKING CLARIFICATION: topic='payment'`
-- В логах: НЕТ строки `DIALOG: turn added` (уточнение не записывается)
+### 7. Проверка контекста (сравнение до/после)
+```sql
+-- Фрагменты БЕЗ контекста (старый метод)
+SELECT COUNT(*) as old_method_count 
+FROM fragments 
+WHERE section_title IS NULL;
 
-```bash
-# Шаг 2: Ответ на уточнение
-curl -X POST http://localhost:8080/api/chat `
-  -H "Content-Type: application/json" `
-  -d '{\"message\": \"Дизайн\", \"session_id\": \"test3\"}'
+-- Фрагменты С контекстом (новый метод)
+SELECT COUNT(*) as new_method_count 
+FROM fragments 
+WHERE section_title IS NOT NULL;
 ```
 
-**Проверка:**
-- Ответ содержит информацию о стоимости дизайна
-- В логах: `CLARIFICATION: restored topic='payment' from PartialInfo`
-- В логах: `DIALOG: turn added, history size=1, topic=payment`
-
-### Сценарий 4: Уточнение + ответ (streaming)
-```bash
-# Шаг 1: Запрос уточнения
-curl -N -X POST http://localhost:8080/api/chat/stream `
-  -H "Content-Type: application/json" `
-  -d '{\"message\": \"Какая стоимость обучения?\", \"session_id\": \"test4\"}'
+### 8. Пример полного контекста фрагмента
+```sql
+SELECT 
+    f.id,
+    f.text,
+    f.section_title,
+    f.parent_titles,
+    f.content_type,
+    f.specialty_code,
+    f.academic_year,
+    p.url,
+    p.title as page_title
+FROM fragments f
+JOIN pages p ON f.page_id = p.id
+WHERE f.section_title IS NOT NULL
+LIMIT 1;
 ```
-
-**Проверка:**
-- Поток возвращает уточняющий вопрос
-- В логах: `ASKING CLARIFICATION: topic='payment'`
-- В логах: НЕТ строки `DIALOG: turn added`
-
-```bash
-# Шаг 2: Ответ на уточнение
-curl -N -X POST http://localhost:8080/api/chat/stream `
-  -H "Content-Type: application/json" `
-  -d '{\"message\": \"Юриспруденция\", \"session_id\": \"test4\"}'
-```
-
-**Проверка:**
-- Поток возвращает ответ + источники
-- В логах: `CLARIFICATION: restored topic='payment' from PartialInfo`
-- В логах: `DIALOG: turn added, history size=1, topic=payment`
-
-### Сценарий 5: Обрыв соединения (streaming)
-```bash
-# Запустить и прервать через 1 секунду (Ctrl+C)
-timeout 1 curl -N -X POST http://localhost:8080/api/chat/stream `
-  -H "Content-Type: application/json" `
-  -d '{\"message\": \"Расскажи подробно про все специальности\", \"session_id\": \"test5\"}'
-```
-
-**Проверка:**
-- В логах: НЕТ строки `Cache save error` или `DIALOG: turn added` после обрыва
-
-## Проверка согласованности состояния
-
-### Сравнение History после одинакового диалога
-
-**Обычный режим:**
-```bash
-curl -X POST http://localhost:8080/api/chat -d '{\"message\": \"Привет\", \"session_id\": \"cmp1\"}'
-curl -X POST http://localhost:8080/api/chat -d '{\"message\": \"Какие специальности?\", \"session_id\": \"cmp1\"}'
-```
-
-**Streaming:**
-```bash
-curl -N -X POST http://localhost:8080/api/chat/stream -d '{\"message\": \"Привет\", \"session_id\": \"cmp2\"}'
-curl -N -X POST http://localhost:8080/api/chat/stream -d '{\"message\": \"Какие специальности?\", \"session_id\": \"cmp2\"}'
-```
-
-**Проверка в логах:**
-- Обе сессии: `history size=1` после первого запроса
-- Обе сессии: `history size=2` после второго запроса
-- Обе сессии: `topic=specialties` после второго запроса
 
 ## Ожидаемые результаты
 
-### Логи GenerateAnswer (обычный режим)
-```
-GenerateAnswer: START
-INTENT: type=greeting topic=general entities=map[] confidence=1.00
-CONTEXT UPDATE: Before update - LastEntities=map[], intent.Entities=map[]
-CONTEXT UPDATE: After update - LastEntities=map[]
-DIALOG: turn added, history size=1, topic=
-ANSWER READY: 45ms
+### После миграции:
+- Версия схемы должна быть **3**
+- Таблица fragments должна содержать новые поля
+- При индексации должны появляться логи: "✅ Created enriched fragments with metadata"
+
+### После индексации:
+- Фрагменты с `section_title` - содержат заголовок раздела
+- Фрагменты с `parent_titles` - JSON массив типа ["Поступающим", "Стоимость"]
+- `content_type` может быть: text, table, list, faq
+- `specialty_code` - коды типа 54.02.01, 40.02.01
+- `academic_year` - годы типа 2025-2026
+
+### Качество поиска:
+- Поиск "стоимость дизайн" теперь найдёт фрагменты с полным контекстом
+- Можно фильтровать по специальности: `WHERE specialty_code = '54.02.01'`
+- Можно фильтровать по году: `WHERE academic_year = '2025-2026'`
+- Таблицы индексируются целиком с типом `content_type = 'table'`
+
+## Откат (если что-то пошло не так)
+
+```bash
+# Сделать бэкап перед тестированием
+cp erudit.db erudit.db.backup
+
+# Откатить изменения (если нужно)
+cp erudit.db.backup erudit.db
 ```
 
-### Логи StreamAnswer (потоковый режим)
-```
-StreamAnswer: START
-INTENT: type=greeting topic=general entities=map[] confidence=1.00
-STREAM DIRECT REPLY: 1.2ms
-CONTEXT UPDATE: Before update - LastEntities=map[], intent.Entities=map[]
-CONTEXT UPDATE: After update - LastEntities=map[]
-DIALOG: turn added, history size=1, topic=
-STREAM COMPLETE: 3ms
-```
+## Следующие шаги после успешного теста
 
-**Ключевое отличие:** Только скорость и наличие `STREAM` в именах, логика идентична.
-
-## Критерии успеха
-
-✅ Компиляция без ошибок  
-✅ Все модульные тесты проходят  
-✅ Приветствия записываются в History в обоих режимах  
-✅ Уточнения НЕ записываются в History  
-✅ Ответы на уточнения записываются с правильным topic  
-✅ History ограничивается 5 записями  
-✅ Обрыв streaming не создает запись в History  
-✅ Обрыв streaming не сохраняет в кэш  
-✅ Состояние сессий согласовано между режимами
+1. Переиндексировать всю базу знаний
+2. Обновить hybrid_search.go для использования метаданных
+3. Реализовать морфологический словарь для русского языка
+4. Добавить фильтры по специальности/году в UI

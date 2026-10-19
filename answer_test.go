@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -182,6 +183,119 @@ func TestFinalizeDialogTurn(t *testing.T) {
 	}
 }
 
+func TestSpecialtySectionSelectsMatchingAnnualTuition(t *testing.T) {
+	if !isTuitionQuestion("Какая стоимость обучения? по специальности дизайн") {
+		t.Fatal("resolved tuition follow-up was not recognized as a tuition question")
+	}
+
+	pageText := `ПОСТУПЛЕНИЕ НА СПЕЦИАЛЬНОСТЬ 54.02.01 «ДИЗАЙН»
+Стоимость обучения: 139 200 рублей в год. Оплата вносится помесячно.
+ПОСТУПЛЕНИЕ НА СПЕЦИАЛЬНОСТЬ 40.02.04 «ЮРИСПРУДЕНЦИЯ»
+Стоимость обучения: 100 800 рублей в год.`
+
+	section, ok := specialtySection(pageText, "54.02.01")
+	if !ok {
+		t.Fatal("specialtySection did not find the design section")
+	}
+	match := annualTuitionPattern.FindStringSubmatch(section)
+	if len(match) != 2 || strings.Join(strings.Fields(match[1]), " ") != "139 200" {
+		t.Fatalf("design tuition = %v, want 139 200", match)
+	}
+	if strings.Contains(section, "100 800") {
+		t.Fatal("design section contains the following specialty's tuition")
+	}
+}
+
+func TestEvidenceFallbackReturnsRelevantFactsWhenModelIsUnavailable(t *testing.T) {
+	contextText := `=== Фрагмент 1 (релевантность: 0.80) ===
+Источник: Преподаватели
+Гапоненко Дарина Олеговна преподаёт дисциплины профессионального цикла.
+=== Фрагмент 2 (релевантность: 0.70) ===
+Источник: Поступающим
+Для поступления подаются заявление и документ об образовании.
+=== Фрагмент 3 (релевантность: 0.60) ===
+Источник: Поступающим
+Стоимость обучения: 139 200 рублей в год.`
+	introduction := "ИИ-модель временно недоступна. Сведения с сайта колледжа:"
+
+	tests := []struct {
+		name     string
+		question string
+		want     string
+	}{
+		{name: "teacher", question: "Кто такая Гапоненко Дарина Олеговна?", want: "Гапоненко Дарина Олеговна"},
+		{name: "admission", question: "Какие документы нужны для поступления?", want: "заявление и документ об образовании"},
+		{name: "tuition", question: "Сколько стоит обучение?", want: "139 200 рублей в год"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			answer, ok := evidenceFallbackAnswer(test.question, contextText, introduction)
+			if !ok {
+				t.Fatal("evidenceFallbackAnswer returned no answer")
+			}
+			if !strings.Contains(answer, test.want) {
+				t.Errorf("fallback answer %q does not contain %q", answer, test.want)
+			}
+			if !strings.HasPrefix(answer, introduction) {
+				t.Errorf("fallback answer should disclose degraded mode: %q", answer)
+			}
+		})
+	}
+}
+
+func TestEvidenceFallbackDoesNotInventAnswerWithoutMatchingEvidence(t *testing.T) {
+	answer, ok := evidenceFallbackAnswer("Сколько стоит обучение?", "В колледже есть библиотека.", "Модель недоступна.")
+	if ok || answer != "" {
+		t.Fatalf("expected no fallback without relevant evidence, got %q", answer)
+	}
+}
+
+func TestEvidenceFallbackRejectsQuestionsAndIncompleteSearchSnippets(t *testing.T) {
+	contextText := `=== Фрагмент 1 ===
+Источник: Поступающим
+Здравствуйте, когда и куда подавать документы на поступление?
+=== Фрагмент 2 ===
+Источник: Поступающим
+Подать документы для поступления (см.
+=== Фрагмент 3 ===
+Источник: Поступающим
+Средний балл, необходимый для поступления, составляет 4,0.`
+	answer, ok := evidenceFallbackAnswer("Какие документы нужны для поступления?", contextText, "Модель недоступна.")
+	if ok || answer != "" {
+		t.Fatalf("expected fallback to reject irrelevant or incomplete snippets, got %q", answer)
+	}
+}
+
+func TestEvidenceFallbackPrefersUniqueDescriptiveTeacherEvidence(t *testing.T) {
+	contextText := `=== Фрагмент 1 ===
+Источник: Преподаватели
+Гапоненко Дарина Олеговна
+Гапоненко Дарина Олеговна
+Преподаватель, куратор Гапоненко Дарина Олеговна.`
+	answer, ok := evidenceFallbackAnswer("Кто такая Гапоненко Дарина Олеговна?", contextText, "Модель недоступна.")
+	if !ok {
+		t.Fatal("expected descriptive teacher evidence")
+	}
+	if !strings.Contains(answer, "Преподаватель, куратор") {
+		t.Errorf("fallback answer should prefer descriptive evidence: %q", answer)
+	}
+	if strings.Count(answer, "Гапоненко Дарина Олеговна") != 1 {
+		t.Errorf("fallback answer should not repeat duplicate evidence: %q", answer)
+	}
+}
+
+func TestLLMUnavailableMessageExplainsQuotaErrors(t *testing.T) {
+	quotaMessage := llmUnavailableMessage(fmt.Errorf("provider response: %w", ErrLLMRateLimited))
+	if !strings.Contains(quotaMessage, "HTTP 429") || !strings.Contains(quotaMessage, "квоты") {
+		t.Fatalf("quota message should explain the API limit: %q", quotaMessage)
+	}
+	temporaryMessage := llmUnavailableMessage(fmt.Errorf("network unavailable"))
+	if strings.Contains(temporaryMessage, "HTTP 429") {
+		t.Fatalf("non-quota errors must not be reported as quota errors: %q", temporaryMessage)
+	}
+}
+
 
 // TestClarificationStateConsistency проверяет обработку уточнений в обоих режимах
 func TestClarificationStateConsistency(t *testing.T) {
@@ -259,4 +373,3 @@ func TestClarificationStateConsistency(t *testing.T) {
 	
 	t.Logf("✓ Состояние уточнений согласовано между режимами")
 }
-

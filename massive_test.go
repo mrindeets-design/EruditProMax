@@ -168,8 +168,16 @@ func TestMassiveQuestions(t *testing.T) {
 		// Создаем контекст для запроса
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		
+		// Создаем LLM провайдера
+		var llmProvider LLMProvider
+		if cfg.LLMProvider == "external" {
+			llmProvider = NewExternalProvider(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel, cfg.LLMTimeout)
+		} else {
+			llmProvider = NewOllamaProvider(cfg.OllamaURL, cfg.OllamaModel, cfg.LLMTimeout)
+		}
+		
 		// Генерируем ответ
-		answer, sources, _, err := GenerateAnswer(ctx, cfg, tc.question, nil)
+		answer, sources, _, err := GenerateAnswer(ctx, cfg, llmProvider, tc.question, nil)
 		cancel()
 		
 		if err != nil {

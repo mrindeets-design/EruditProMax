@@ -211,13 +211,46 @@ func (c *Crawler) processPage(pageURL string, depth int) error {
 	}
 
 	htmlContent := decodeHTML(body, resp.Header.Get("Content-Type"))
-	cleanText := extractTextFromHTML(htmlContent)
-	contentHash := computeHash(cleanText)
-
-	title := extractTitle(htmlContent, pageURL)
-	specialtyCode, specialtyName := extractSpecialty(htmlContent, pageURL)
-	academicYear := DetectAcademicYear(cleanText)
+	
+	// Определяем общие переменные для всех путей
 	kind := c.detectPageKind(pageURL)
+	now := time.Now().UTC().Format(time.RFC3339)
+	
+	// НОВЫЙ ПОДХОД: Используем структурированный парсер
+	doc, err := ParseHTMLStructure(htmlContent, pageURL)
+	if err != nil {
+		log.Printf("  ⚠️  Structured parsing failed, falling back to old method: %v", err)
+		// Fallback на старый метод
+		cleanText := extractTextFromHTML(htmlContent)
+		contentHash := computeHash(cleanText)
+		title := extractTitle(htmlContent, pageURL)
+		specialtyCode, specialtyName := extractSpecialty(htmlContent, pageURL)
+		academicYear := DetectAcademicYear(cleanText)
+		
+		sourceID, err := c.getOrCreateSource(pageURL, title, kind)
+		if err != nil {
+			return fmt.Errorf("get source: %w", err)
+		}
+		
+		return c.savePage_Legacy(sourceID, pageURL, finalURL, contentHash, htmlContent, cleanText, title, 
+			specialtyCode, specialtyName, academicYear, resp, now)
+	}
+	
+	// Используем данные из структурированного парсера
+	cleanText := extractCleanTextFromDoc(doc)
+	contentHash := computeHash(cleanText)
+	title := doc.Title
+	if title == "" {
+		title = extractTitle(htmlContent, pageURL)
+	}
+	
+	// Извлекаем специальность из структуры документа
+	specialtyCode := extractSpecialtyCodeFromDoc(doc)
+	specialtyName := extractSpecialtyNameFromDoc(doc)
+	academicYear := doc.PublishedAt
+	if academicYear == "" {
+		academicYear = DetectAcademicYear(cleanText)
+	}
 
 	sourceID, err := c.getOrCreateSource(pageURL, title, kind)
 	if err != nil {
@@ -228,17 +261,15 @@ func (c *Crawler) processPage(pageURL string, depth int) error {
 	var existingHash string
 	err = c.db.QueryRow(`SELECT id, content_hash FROM pages WHERE url = ?`, pageURL).Scan(&existingID, &existingHash)
 
-	now := time.Now().UTC().Format(time.RFC3339)
-
 	if err == sql.ErrNoRows {
 		result, err := c.db.Exec(`
 			INSERT INTO pages (
-				source_id, url, final_url, content_hash, clean_text, title,
+				source_id, url, final_url, content_hash, raw_html, clean_text, title,
 				specialty_code, specialty_name, academic_year,
 				version_number, fetched_at, last_check_at, last_success_at,
 				http_etag, http_last_modified
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-		`, sourceID, pageURL, finalURL, contentHash, cleanText, title,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+		`, sourceID, pageURL, finalURL, contentHash, htmlContent, cleanText, title,
 			specialtyCode, specialtyName, academicYear,
 			now, now, now,
 			resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"))
@@ -250,17 +281,27 @@ func (c *Crawler) processPage(pageURL string, depth int) error {
 		pageID, _ := result.LastInsertId()
 		log.Printf("  ✅ New page saved (id=%d)", pageID)
 
-		if err := c.createFragments(pageID, 0, cleanText); err != nil {
-			log.Printf("  ⚠️  Failed to create fragments: %v", err)
+		// НОВЫЙ ПОДХОД: Используем CreateEnrichedFragments
+		if err := CreateEnrichedFragments(c.db, pageID, doc); err != nil {
+			log.Printf("  ⚠️  Failed to create enriched fragments: %v", err)
+			// Fallback на старый метод
+			if err := c.createFragments(pageID, 0, cleanText); err != nil {
+				log.Printf("  ⚠️  Failed to create fragments (legacy): %v", err)
+			}
+		} else {
+			log.Printf("  ✅ Created enriched fragments with metadata")
 		}
 
 		atomic.AddInt32(&c.stats.PagesNew, 1)
+
 
 	} else if err != nil {
 		return fmt.Errorf("check existing page: %w", err)
 	} else {
 		if existingHash == contentHash {
-			_, err = c.db.Exec(`UPDATE pages SET last_check_at = ?, last_success_at = ? WHERE id = ?`, now, now, existingID)
+			// Обновляем raw_html даже для неизменённых страниц (для миграции)
+			_, err = c.db.Exec(`UPDATE pages SET raw_html = ?, last_check_at = ?, last_success_at = ? WHERE id = ?`, 
+				htmlContent, now, now, existingID)
 			if err != nil {
 				return fmt.Errorf("update check time: %w", err)
 			}
@@ -280,12 +321,12 @@ func (c *Crawler) processPage(pageURL string, depth int) error {
 
 			_, err = c.db.Exec(`
 				UPDATE pages SET
-					final_url = ?, content_hash = ?, clean_text = ?, title = ?,
+					final_url = ?, content_hash = ?, raw_html = ?, clean_text = ?, title = ?,
 					specialty_code = ?, specialty_name = ?, academic_year = ?,
 					version_number = ?, fetched_at = ?, last_check_at = ?, last_success_at = ?,
 					http_etag = ?, http_last_modified = ?
 				WHERE id = ?
-			`, finalURL, contentHash, cleanText, title,
+			`, finalURL, contentHash, htmlContent, cleanText, title,
 				specialtyCode, specialtyName, academicYear,
 				newVersion, now, now, now,
 				resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"),
@@ -296,8 +337,16 @@ func (c *Crawler) processPage(pageURL string, depth int) error {
 			}
 
 			c.db.Exec(`DELETE FROM fragments WHERE page_id = ?`, existingID)
-			if err := c.createFragments(existingID, 0, cleanText); err != nil {
-				log.Printf("  ⚠️  Failed to update fragments: %v", err)
+			
+			// НОВЫЙ ПОДХОД: Используем CreateEnrichedFragments
+			if err := CreateEnrichedFragments(c.db, existingID, doc); err != nil {
+				log.Printf("  ⚠️  Failed to create enriched fragments: %v", err)
+				// Fallback на старый метод
+				if err := c.createFragments(existingID, 0, cleanText); err != nil {
+					log.Printf("  ⚠️  Failed to update fragments (legacy): %v", err)
+				}
+			} else {
+				log.Printf("  ✅ Updated enriched fragments with metadata")
 			}
 
 			log.Printf("  🔄 Updated (id=%d, v%d→v%d)", existingID, currentVersion, newVersion)
@@ -741,3 +790,182 @@ func computeHash(text string) string {
 	hash := sha256.Sum256([]byte(text))
 	return hex.EncodeToString(hash[:])
 }
+
+// extractCleanTextFromDoc извлекает чистый текст из DocumentStructure для хранения в pages.clean_text
+func extractCleanTextFromDoc(doc *DocumentStructure) string {
+	var parts []string
+	
+	// Добавляем заголовок и описание
+	if doc.Title != "" {
+		parts = append(parts, doc.Title)
+	}
+	if doc.Description != "" {
+		parts = append(parts, doc.Description)
+	}
+	
+	// Добавляем текст из всех секций
+	for _, section := range doc.Sections {
+		if section.Title != "" {
+			parts = append(parts, section.Title)
+		}
+		if section.Content != "" {
+			parts = append(parts, section.Content)
+		}
+	}
+	
+	// Добавляем таблицы
+	for _, table := range doc.Tables {
+		if table.Caption != "" {
+			parts = append(parts, table.Caption)
+		}
+		// Добавляем заголовки таблицы
+		if len(table.Headers) > 0 {
+			parts = append(parts, strings.Join(table.Headers, " | "))
+		}
+		// Добавляем строки таблицы
+		for _, row := range table.Rows {
+			parts = append(parts, strings.Join(row, " | "))
+		}
+	}
+	
+	return strings.Join(parts, "\n\n")
+}
+
+// extractSpecialtyCodeFromDoc извлекает код специальности из структуры документа
+func extractSpecialtyCodeFromDoc(doc *DocumentStructure) string {
+	// Проверяем заголовок документа
+	codePattern := regexp.MustCompile(`(\d{2}\.\d{2}\.\d{2})`)
+	if match := codePattern.FindStringSubmatch(doc.Title); len(match) > 1 {
+		return match[1]
+	}
+	
+	// Проверяем заголовки секций
+	for _, section := range doc.Sections {
+		if match := codePattern.FindStringSubmatch(section.Title); len(match) > 1 {
+			return match[1]
+		}
+	}
+	
+	// Проверяем метаданные
+	if specialty, ok := doc.Metadata["specialty_code"]; ok {
+		return specialty
+	}
+	
+	return ""
+}
+
+// extractSpecialtyNameFromDoc извлекает название специальности из структуры документа
+func extractSpecialtyNameFromDoc(doc *DocumentStructure) string {
+	code := extractSpecialtyCodeFromDoc(doc)
+	if code == "" {
+		return ""
+	}
+	
+	// Ищем название рядом с кодом
+	namePattern := regexp.MustCompile(code + `\s*[«"]?([А-Яа-яёЁ\s-]+)[»"]?`)
+	
+	// Проверяем заголовок документа
+	if match := namePattern.FindStringSubmatch(doc.Title); len(match) > 1 {
+		return strings.TrimSpace(match[1])
+	}
+	
+	// Проверяем заголовки секций
+	for _, section := range doc.Sections {
+		if match := namePattern.FindStringSubmatch(section.Title); len(match) > 1 {
+			return strings.TrimSpace(match[1])
+		}
+	}
+	
+	return ""
+}
+
+// savePage_Legacy - старый метод сохранения страницы (fallback)
+func (c *Crawler) savePage_Legacy(sourceID int64, pageURL, finalURL, contentHash, rawHTML, cleanText, title, 
+	specialtyCode, specialtyName, academicYear string, resp *http.Response, now string) error {
+	
+	var existingID int64
+	var existingHash string
+	err := c.db.QueryRow(`SELECT id, content_hash FROM pages WHERE url = ?`, pageURL).Scan(&existingID, &existingHash)
+
+	if err == sql.ErrNoRows {
+		result, err := c.db.Exec(`
+			INSERT INTO pages (
+				source_id, url, final_url, content_hash, raw_html, clean_text, title,
+				specialty_code, specialty_name, academic_year,
+				version_number, fetched_at, last_check_at, last_success_at,
+				http_etag, http_last_modified
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+		`, sourceID, pageURL, finalURL, contentHash, rawHTML, cleanText, title,
+			specialtyCode, specialtyName, academicYear,
+			now, now, now,
+			resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"))
+
+		if err != nil {
+			return fmt.Errorf("insert page: %w", err)
+		}
+
+		pageID, _ := result.LastInsertId()
+		log.Printf("  ✅ New page saved (id=%d, legacy mode)", pageID)
+
+		if err := c.createFragments(pageID, 0, cleanText); err != nil {
+			log.Printf("  ⚠️  Failed to create fragments: %v", err)
+		}
+
+		atomic.AddInt32(&c.stats.PagesNew, 1)
+		return nil
+
+	} else if err != nil {
+		return fmt.Errorf("check existing page: %w", err)
+	}
+
+	// Страница уже существует - обновляем если изменилась
+	if existingHash == contentHash {
+		// Обновляем raw_html даже для неизменённых страниц (для миграции)
+		_, err = c.db.Exec(`UPDATE pages SET raw_html = ?, last_check_at = ?, last_success_at = ? WHERE id = ?`, 
+			rawHTML, now, now, existingID)
+		if err != nil {
+			return fmt.Errorf("update check time: %w", err)
+		}
+		log.Printf("  ✓ Unchanged (id=%d, legacy mode)", existingID)
+		atomic.AddInt32(&c.stats.PagesUnchanged, 1)
+		return nil
+	}
+
+	// Контент изменился - создаем новую версию
+	var currentVersion int
+	c.db.QueryRow(`SELECT version_number FROM pages WHERE id = ?`, existingID).Scan(&currentVersion)
+	newVersion := currentVersion + 1
+
+	_, err = c.db.Exec(`
+		INSERT INTO page_versions (page_id, version_number, content_hash, clean_text, changed_at)
+		VALUES (?, ?, ?, (SELECT clean_text FROM pages WHERE id = ?), ?)
+	`, existingID, currentVersion, existingHash, existingID, now)
+
+	_, err = c.db.Exec(`
+		UPDATE pages SET
+			final_url = ?, content_hash = ?, raw_html = ?, clean_text = ?, title = ?,
+			specialty_code = ?, specialty_name = ?, academic_year = ?,
+			version_number = ?, fetched_at = ?, last_check_at = ?, last_success_at = ?,
+			http_etag = ?, http_last_modified = ?
+		WHERE id = ?
+	`, finalURL, contentHash, rawHTML, cleanText, title,
+		specialtyCode, specialtyName, academicYear,
+		newVersion, now, now, now,
+		resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"),
+		existingID)
+
+	if err != nil {
+		return fmt.Errorf("update page: %w", err)
+	}
+
+	c.db.Exec(`DELETE FROM fragments WHERE page_id = ?`, existingID)
+	if err := c.createFragments(existingID, 0, cleanText); err != nil {
+		log.Printf("  ⚠️  Failed to update fragments: %v", err)
+	}
+
+	log.Printf("  🔄 Updated (id=%d, v%d→v%d, legacy mode)", existingID, currentVersion, newVersion)
+	atomic.AddInt32(&c.stats.PagesUpdated, 1)
+	
+	return nil
+}
+

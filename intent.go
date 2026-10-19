@@ -159,7 +159,7 @@ func detectTopic(q string, context *DialogContext) string {
 		"practice":  {"практик", "стажировк", "производственн", "учебная практика"},
 		"schedule":  {"расписан", "когда занятия", "урок", "пар", "время", "график"},
 		"contacts":  {"контакт", "телефон", "адрес", "email", "почта", "где находится", "как добраться"},
-		"staff":     {"преподава", "учитель", "учителя", "директор", "руководитель", "завуч", "кто ведет", "кто преподает", "педагог", "препод", "предмет", "дисциплин", "богитова", "юлия"},
+		"staff":     {"преподава", "учитель", "учителя", "директор", "руководитель", "завуч", "кто ведет", "кто преподает", "педагог", "препод", "предмет", "дисциплин", "кто такая", "кто такой", "кто это", "кто эта", "кто этот", "сотрудник", "работник", "фамилия"},
 		"specialty": {"специальность", "направлен", "профес", "квалификац", "факультет", "кафедра", "отделение"},
 		"news":      {"новост", "событи", "мероприят", "когда прошло", "что нового"},
 		"documents": {"справк", "аттестат", "диплом", "свидетельств", "документ"},
@@ -471,9 +471,30 @@ func resolveAnaphora(intent *Intent, context *DialogContext) {
 	}
 	
 	// Обрабатываем "там"
-	if strings.Contains(q, "там") && len(context.LastSources) > 0 {
-		// Пользователь ссылается на источники из предыдущего ответа
-		intent.Conditions = append(intent.Conditions, "в упомянутых источниках")
+	if strings.Contains(q, "там") {
+		// "там" может означать:
+		// 1. В том месте/колледже (контекст места)
+		// 2. В той специальности (контекст специальности)
+		// 3. В тех источниках (контекст источников)
+		
+		// Если в предыдущем вопросе была специальность - наследуем её
+		if spec, ok := context.LastEntities["specialty"]; ok {
+			intent.Entities["specialty"] = spec
+			log.Printf("ANAPHORA 'там': inherited specialty='%s' from context", spec)
+		}
+		
+		// Если предыдущая тема была о специальности или поступлении - наследуем тему
+		if context.CurrentTopic != "" && context.CurrentTopic != "general" {
+			if intent.Topic == "general" {
+				intent.Topic = context.CurrentTopic
+				log.Printf("ANAPHORA 'там': inherited topic='%s' from context", intent.Topic)
+			}
+		}
+		
+		// Если были источники из предыдущего ответа
+		if len(context.LastSources) > 0 {
+			intent.Conditions = append(intent.Conditions, "в упомянутых источниках")
+		}
 	}
 	
 	// Обрабатываем местоимения
@@ -646,12 +667,16 @@ func checkAmbiguity(intent *Intent, q string, context *DialogContext) {
 			log.Printf("checkAmbiguity: NO specialty in context! context.LastEntities=%v", context.LastEntities)
 		}
 		
-		// Не требуем уточнения для общих вопросов типа "Есть ли бюджетные места?"
+		// ИЗМЕНЕНО: НЕ требуем уточнения для общих вопросов о стоимости
+		// Вместо этого бот даст агрегированную информацию по всем специальностям
+		// Поэтому закомментируем эту проверку
+		/*
 		if !hasSpecialty && !containsAny(q, "вообще", "в принципе", "есть ли", "бывают ли") {
 			intent.IsAmbiguous = true
 			intent.Confidence = 0.6
 			return
 		}
+		*/
 	}
 	
 	// 3. Вопрос слишком общий без контекста (только одиночные слова-вопросы)
@@ -679,21 +704,11 @@ func BuildClarificationQuestion(intent Intent, dialogContext *DialogContext) str
 	
 	log.Printf("BuildClarificationQuestion: q='%s' topic='%s' entities=%v", q, intent.Topic, intent.Entities)
 	
-	// Неоднозначная специальность для вопросов о стоимости/бюджете
+	// ИЗМЕНЕНО: НЕ просим уточнение для вопросов о стоимости
+	// Вместо этого бот даст агрегированную информацию по всем специальностям
 	if containsAny(q, "стоимость", "цена", "оплат", "бюджет", "платн", "контракт") {
-		if _, hasSpec := intent.Entities["specialty"]; !hasSpec {
-			// Проверяем, есть ли специальность в контексте диалога
-			if dialogContext != nil && dialogContext.LastEntities != nil {
-				if _, hasSpecInContext := dialogContext.LastEntities["specialty"]; hasSpecInContext {
-					log.Printf("BuildClarificationQuestion: specialty found in LastEntities, no clarification needed")
-					return "" // Специальность уже известна из контекста
-				}
-			}
-			
-			clarification := "Уточните, пожалуйста, о какой специальности вы спрашиваете: дизайн, юриспруденция, преподавание в начальных классах или право и социальное обеспечение?"
-			log.Printf("BuildClarificationQuestion: returning payment clarification")
-			return clarification
-		}
+		log.Printf("BuildClarificationQuestion: payment question detected, returning empty (no clarification needed)")
+		return "" // Не просим уточнения, бот даст информацию по всем специальностям
 	}
 	
 	// Слишком общий вопрос
@@ -702,7 +717,7 @@ func BuildClarificationQuestion(intent Intent, dialogContext *DialogContext) str
 		case "admission":
 			return "Что именно вас интересует о поступлении: документы, сроки, экзамены или условия зачисления?"
 		case "payment":
-			return "Уточните, пожалуйста, о какой специальности идёт речь: дизайн, юриспруденция, преподавание или право?"
+			return "" // Не просим уточнения для вопросов о стоимости
 		case "general":
 			return "Уточните, пожалуйста, ваш вопрос. О чём именно вы хотите узнать?"
 		}
