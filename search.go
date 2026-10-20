@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"log"
 	"sort"
 	"strings"
@@ -71,45 +72,206 @@ func PrepareSearchQuery(intent Intent) []SearchQuery {
 }
 
 // buildOptimalSearchText создаёт оптимизированный текст для поиска
+
+// Специальные маппинги ключевых слов на важные страницы
+var keywordPageMap = map[string][]string{
+	"пересдача":   {"/retake/", "направление", "справка"},
+	"пересдать":   {"/retake/", "направление"},
+	"направление": {"/retake/"},
+	"справка":     {"/retake/", "обучение"},
+}
+
+
+// УЛУЧШЕНО: сохраняет имена собственные (Named Entities)
 func buildOptimalSearchText(intent Intent) string {
-	// Убираем приветствия и вежливые слова
 	text := intent.Question
 	text = strings.TrimSpace(text)
 	
-	// Убираем приветствия
+	// ШАГ 1: Извлекаем имена собственные (слова с заглавной буквы)
+	properNouns := extractProperNouns(text)
+	if len(properNouns) > 0 {
+		log.Printf("🔤 Extracted proper nouns: %v", properNouns)
+	}
+	
+	// ШАГ 2: Приводим к нижнему регистру для обработки
+	textLower := strings.ToLower(text)
+	
+	// ШАГ 3: Убираем приветствия
 	greetings := []string{"привет", "здравствуйте", "добрый день", "добрый вечер", "доброе утро", "hi", "hello"}
 	for _, g := range greetings {
-		text = strings.TrimPrefix(strings.ToLower(text), g)
-		text = strings.TrimLeft(text, ", ")
-		text = strings.TrimSpace(text)
+		if strings.HasPrefix(textLower, g) {
+			textLower = strings.TrimPrefix(textLower, g)
+			textLower = strings.TrimLeft(textLower, ", ")
+			textLower = strings.TrimSpace(textLower)
+		}
 	}
 	
-	// Убираем вежливые обращения
-	polite := []string{"подскажи", "подскажите", "скажи", "скажите", "расскажи", "расскажите", "пожалуйста"}
-	for _, p := range polite {
-		text = strings.ReplaceAll(strings.ToLower(text), p, "")
-		text = strings.TrimLeft(text, ", ")
-		text = strings.TrimSpace(text)
+	// ШАГ 4: Убираем вежливые слова (целиком, не как подстроки)
+	politeWords := []string{"подскажи", "подскажите", "скажи", "скажите", "расскажи", "расскажите", "пожалуйста", "будьте добры"}
+	words := strings.Fields(textLower)
+	filteredWords := []string{}
+	for _, word := range words {
+		cleanWord := strings.Trim(word, ".,!?;:()[]{}\"'")
+		isPolite := false
+		for _, p := range politeWords {
+			if cleanWord == p {
+				isPolite = true
+				break
+			}
+		}
+		if !isPolite {
+			filteredWords = append(filteredWords, word)
+		}
+	}
+	textLower = strings.Join(filteredWords, " ")
+	
+	// ШАГ 5: Убираем служебные предлоги если они в начале
+	prepositions := []string{"о ", "об ", "про ", "по поводу ", "насчет ", "на тему "}
+	for _, prep := range prepositions {
+		if strings.HasPrefix(textLower, prep) {
+			textLower = strings.TrimPrefix(textLower, prep)
+		}
 	}
 	
-	// Если есть специальность в сущностях, добавляем её явно
+	// Очищаем лишние пробелы
+	textLower = strings.Join(strings.Fields(textLower), " ")
+	textLower = strings.TrimSpace(textLower)
+	
+	// ШАГ 6: Восстанавливаем имена собственные в исходном регистре
+	finalText := restoreProperNouns(textLower, properNouns)
+	
+	// ШАГ 7: Если есть специальность в сущностях, добавляем её явно
 	if spec, ok := intent.Entities["specialty"]; ok && spec != "" {
-		// Проверяем, есть ли уже специальность в тексте
-		if !strings.Contains(strings.ToLower(text), strings.ToLower(spec)) {
-			text = text + " " + spec
+		if !strings.Contains(strings.ToLower(finalText), strings.ToLower(spec)) {
+			finalText = finalText + " " + spec
 		}
 	}
 	
-	// Если есть код специальности, добавляем его явно для точного поиска
+	// ШАГ 8: Если есть код специальности, добавляем его явно
 	if code, ok := intent.Entities["specialty_code"]; ok && code != "" {
-		// Проверяем, есть ли уже код в тексте
-		if !strings.Contains(text, code) {
-			text = text + " " + code
+		if !strings.Contains(finalText, code) {
+			finalText = finalText + " " + code
 		}
 	}
 	
-	return strings.TrimSpace(text)
+	// ШАГ 9: Для запросов о преподавателях добавляем контекст
+	if intent.Topic == "staff" || containsAny(textLower, "преподаватель", "преподает", "преподаёт", "учитель", "ведёт", "ведет") {
+		// Добавляем ключевые слова для усиления поиска по teachers
+		if len(properNouns) > 0 {
+			// Если есть имена - это поиск конкретного преподавателя
+			finalText = finalText + " преподаватель"
+		}
+	}
+	
+	// ШАГ 10: Расширение запроса синонимами для ключевых страниц
+	queryWords := strings.Fields(textLower)
+	for _, word := range queryWords {
+		if synonyms, ok := keywordPageMap[word]; ok {
+			for _, syn := range synonyms {
+				// Добавляем синонимы/ключевые слова
+				if !strings.Contains(finalText, syn) {
+					finalText = finalText + " " + syn
+				}
+			}
+		}
+	}
+	
+	if finalText != text {
+		log.Printf("📝 Query optimization: '%s' → '%s'", text, finalText)
+	}
+	
+	return strings.TrimSpace(finalText)
 }
+
+// extractProperNouns извлекает имена собственные (слова с заглавной буквы)
+func extractProperNouns(text string) []string {
+	words := strings.Fields(text)
+	properNouns := []string{}
+	
+	// Служебные слова, которые НЕ являются именами собственными
+	serviceWords := map[string]bool{
+		"расскажи": true, "подскажи": true, "скажи": true, "привет": true, "здравствуйте": true,
+		"кто": true, "что": true, "где": true, "когда": true, "почему": true, "как": true,
+		"какой": true, "какая": true, "какие": true, "чей": true, "чья": true,
+	}
+	
+	for idx, word := range words {
+		// Очищаем от пунктуации
+		cleaned := strings.Trim(word, ".,!?;:()[]{}\"'")
+		if len(cleaned) == 0 {
+			continue
+		}
+		
+		// Проверяем, начинается ли с заглавной буквы
+		firstRune := []rune(cleaned)[0]
+		if unicode.IsUpper(firstRune) {
+			// Проверяем, не является ли это служебным словом
+			cleanedLower := strings.ToLower(cleaned)
+			if serviceWords[cleanedLower] {
+				continue
+			}
+			
+			// Пропускаем первое слово если оно служебное
+			if idx == 0 && serviceWords[cleanedLower] {
+				continue
+			}
+			
+			properNouns = append(properNouns, cleaned)
+		}
+	}
+	
+	return properNouns
+}
+
+// restoreProperNouns восстанавливает имена собственные в правильном регистре
+func restoreProperNouns(textLower string, properNouns []string) string {
+	if len(properNouns) == 0 {
+		return textLower
+	}
+	
+	result := textLower
+	
+	// Для каждого имени собственного находим его в нижнем регистре и заменяем
+	for _, proper := range properNouns {
+		properLower := strings.ToLower(proper)
+		
+		// Заменяем как отдельное слово (с границами слов), игнорируя пунктуацию
+		words := strings.Fields(result)
+		for i, word := range words {
+			// Очищаем слово от пунктуации для сравнения
+			cleanWord := strings.Trim(strings.ToLower(word), ".,!?;:()[]{}\"'")
+			if cleanWord == properLower {
+				// Восстанавливаем с сохранением пунктуации
+				prefix := ""
+				suffix := ""
+				origWord := word
+				
+				// Сохраняем префикс-пунктуацию
+				for len(word) > 0 && strings.ContainsRune(".,!?;:()[]{}\"'", rune(word[0])) {
+					prefix += string(word[0])
+					word = word[1:]
+				}
+				
+				// Сохраняем суффикс-пунктуацию
+				for len(word) > 0 && strings.ContainsRune(".,!?;:()[]{}\"'", rune(word[len(word)-1])) {
+					suffix = string(word[len(word)-1]) + suffix
+					word = word[:len(word)-1]
+				}
+				
+				// Если после очистки осталось что-то
+				if len(word) > 0 {
+					words[i] = prefix + proper + suffix
+				} else {
+					words[i] = origWord
+				}
+			}
+		}
+		result = strings.Join(words, " ")
+	}
+	
+	return result
+}
+
 
 // splitCompoundQuestion разделяет составной вопрос на части
 func splitCompoundQuestion(question string) []string {
@@ -148,7 +310,7 @@ func SearchMaterials(ctx context.Context, cfg Config, queries []SearchQuery) ([]
 // SearchMaterialsWithContext ищет релевантные материалы с учетом контекста диалога
 func SearchMaterialsWithContext(ctx context.Context, cfg Config, queries []SearchQuery, dialogContext *DialogContext) ([]SearchResult, error) {
 	// РЕФАКТОРИНГ: Определяем минимальный порог релевантности
-	const minRelevanceThreshold = 0.3
+	const minRelevanceThreshold = 0.01 // ИСПРАВЛЕНО: было 0.3, теперь соответствует RRF
 	
 	allResults := []SearchResult{}
 	
@@ -720,25 +882,36 @@ func calculateRelevanceWithContext(query SearchQuery, fragment string, dialogCon
 
 
 // CheckSufficiency проверяет достаточность результатов
+// Работает с RRF-based оценками (после бонусов)
 func CheckSufficiency(query SearchQuery, results []SearchResult) bool {
 	if len(results) == 0 {
 		return false
 	}
 	
+	// Высокая релевантность: RRF base > 0.02 (примерно rank 10-20) + бонусы
+	// После бонусов итоговая оценка может быть 0.3-0.8
+	const highRelevanceThreshold = 0.25
+	
 	highRelevanceCount := 0
 	for _, r := range results {
-		if r.Relevance > 0.5 {
+		if r.Relevance > highRelevanceThreshold {
 			highRelevanceCount++
 		}
 	}
 	
+	// Достаточно 2+ высокорелевантных фрагмента
 	if highRelevanceCount >= 2 {
+		log.Printf("✅ Sufficient: %d high-relevance results (>%.2f)", highRelevanceCount, highRelevanceThreshold)
 		return true
 	}
 	
+	// Альтернативный критерий: покрытие ключевых слов
 	keywords := extractKeywords(query.Text)
-	coveredKeywords := 0
+	if len(keywords) == 0 {
+		return len(results) > 0 // Если нет ключевых слов - любой результат подойдет
+	}
 	
+	coveredKeywords := 0
 	combinedText := ""
 	for i, r := range results {
 		if i >= 5 {
@@ -753,24 +926,34 @@ func CheckSufficiency(query SearchQuery, results []SearchResult) bool {
 		}
 	}
 	
-	return float64(coveredKeywords)/float64(len(keywords)) >= 0.6
+	// Покрыто >=60% ключевых слов
+	coverage := float64(coveredKeywords) / float64(len(keywords))
+	if coverage >= 0.6 {
+		log.Printf("✅ Sufficient: %.0f%% keyword coverage (%d/%d)", coverage*100, coveredKeywords, len(keywords))
+		return true
+	}
+	
+	log.Printf("⚠️ Insufficient: high_rel=%d/%d, coverage=%.0f%%", highRelevanceCount, len(results), coverage*100)
+	return false
 }
 
 // RetrySearch повторяет поиск с альтернативными формулировками
-func RetrySearch(ctx context.Context, cfg Config, query SearchQuery, attempt int) ([]SearchResult, error) {
-	return RetrySearchWithContext(ctx, cfg, query, attempt, nil)
+func RetrySearch(ctx context.Context, db *sql.DB, cfg Config, query SearchQuery, attempt int) ([]SearchResult, error) {
+	return RetrySearchWithContext(ctx, db, cfg, query, attempt, nil)
 }
 
 // RetrySearchWithContext повторяет поиск с альтернативными формулировками с учетом контекста
-func RetrySearchWithContext(ctx context.Context, cfg Config, query SearchQuery, attempt int, dialogContext *DialogContext) ([]SearchResult, error) {
+func RetrySearchWithContext(ctx context.Context, db *sql.DB, cfg Config, query SearchQuery, attempt int, dialogContext *DialogContext) ([]SearchResult, error) {
 	if attempt > 2 {
 		return []SearchResult{}, nil
 	}
 	
-	log.Printf("Повторный поиск (попытка %d) для: %s", attempt, query.Text)
+	log.Printf("🔄 Повторный поиск (попытка %d) для: %s", attempt, query.Text)
 	
 	altQueries := generateAlternativeQueries(query)
-	return SearchMaterialsWithContext(ctx, cfg, altQueries, dialogContext)
+	
+	// ИСПРАВЛЕНО: используем тот же AdvancedEngine, что и основной поиск
+	return SearchMaterialsWithAdvancedEngine(ctx, db, cfg, altQueries, dialogContext)
 }
 
 // generateAlternativeQueries генерирует альтернативные формулировки

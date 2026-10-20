@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // =========================================================
@@ -69,8 +71,8 @@ func NewSearchEngine(db *sql.DB, cfg Config) (*SearchEngine, error) {
 	se := &SearchEngine{
 		db:                db,
 		cfg:               cfg,
-		minScoreThreshold: 0.2, // Снижен для широкого первичного поиска
-		rrfK:              60,  // Стандартное значение для RRF
+		minScoreThreshold: 0.01, // ИСПРАВЛЕНО: порог для чистого RRF (max ~0.033)
+		rrfK:              60,   // Стандартное значение для RRF
 	}
 
 	// Загружаем конфигурацию из БД
@@ -99,7 +101,7 @@ func (se *SearchEngine) loadConfig() error {
 		if err := rows.Scan(&key, &value); err != nil {
 			continue
 		}
-
+		
 		switch key {
 		case "embedding_model":
 			se.embeddingModel = value
@@ -111,8 +113,8 @@ func (se *SearchEngine) loadConfig() error {
 			fmt.Sscanf(value, "%d", &se.rrfK)
 		}
 	}
-
-	return nil
+	
+	return rows.Err()
 }
 
 // checkFTS5Support проверяет поддержку FTS5
@@ -227,37 +229,63 @@ func (se *SearchEngine) deduplicateResults(results []HybridSearchResult) []Hybri
 }
 
 // selectEvidentialFragments отбирает доказательные фрагменты
+// ИСПРАВЛЕНО: гарантирует сохранение TOP-результатов по score
 func (se *SearchEngine) selectEvidentialFragments(results []HybridSearchResult, query string) []HybridSearchResult {
-	queryNorm := normalize(query)
-	queryWords := extractKeywords(queryNorm)
+	if len(results) == 0 {
+		return results
+	}
 	
+	// ГАРАНТИЯ: всегда сохраняем TOP-4 результата по score (независимо от фильтров)
+	topN := 4
+	if len(results) < topN {
+		topN = len(results)
+	}
+	
+	// Создаём множество для отслеживания уже включённых фрагментов
+	seen := make(map[int64]bool)
 	evidential := []HybridSearchResult{}
 	
-	for _, r := range results {
-		textNorm := normalize(r.Text)
+	// ШАГ 1: Добавляем TOP-N результатов (гарантированно)
+	for i := 0; i < topN; i++ {
+		evidential = append(evidential, results[i])
+		seen[results[i].FragmentID] = true
+	}
+	log.Printf("  ✅ Evidence: guaranteed top-%d by score", topN)
+	
+	// ШАГ 2: Дополнительно проверяем остальные на наличие ключевых слов
+	// (только если нужны дополнительные фрагменты)
+	if topN < len(results) {
+		queryNorm := normalize(query)
+		queryWords := extractKeywords(queryNorm)
 		
-		// Проверяем наличие ключевых слов запроса
-		matchCount := 0
-		for _, kw := range queryWords {
-			if strings.Contains(textNorm, kw) {
-				matchCount++
+		additionalCount := 0
+		for i := topN; i < len(results) && additionalCount < 2; i++ {
+			r := results[i]
+			if seen[r.FragmentID] {
+				continue
+			}
+			
+			textNorm := normalize(r.Text)
+			
+			// Проверяем наличие ключевых слов запроса
+			matchCount := 0
+			for _, kw := range queryWords {
+				if strings.Contains(textNorm, kw) {
+					matchCount++
+				}
+			}
+			
+			// Добавляем если содержит хотя бы 40% ключевых слов
+			if len(queryWords) > 0 && float64(matchCount)/float64(len(queryWords)) >= 0.4 {
+				evidential = append(evidential, r)
+				seen[r.FragmentID] = true
+				additionalCount++
 			}
 		}
 		
-		// Фрагмент доказательный, если содержит хотя бы 40% ключевых слов
-		if len(queryWords) > 0 && float64(matchCount)/float64(len(queryWords)) >= 0.4 {
-			evidential = append(evidential, r)
+		if additionalCount > 0 {
+			log.Printf("  ➕ Evidence: +%d additional keyword-matched", additionalCount)
 		}
-	}
-	
-	// Если слишком строгий фильтр отсек все - берем top-N по оценке
-	if len(evidential) == 0 && len(results) > 0 {
-		limit := 5
-		if len(results) < limit {
-			limit = len(results)
-		}
-		evidential = results[:limit]
-		log.Printf("  ⚠️  Evidence filter too strict, taking top-%d by score", limit)
 	}
 	
 	return evidential
@@ -285,6 +313,11 @@ func (se *SearchEngine) filterByThreshold(results []HybridSearchResult) []Hybrid
 
 // lexicalSearch выполняет полнотекстовый поиск (FTS5)
 func (se *SearchEngine) lexicalSearch(ctx context.Context, query string, limit int) ([]HybridSearchResult, error) {
+	// Guard: пустой запрос
+	if strings.TrimSpace(query) == "" {
+		return []HybridSearchResult{}, nil
+	}
+	
 	// Нормализуем запрос для FTS5
 	searchQuery := se.prepareFTS5Query(query)
 	
@@ -300,8 +333,8 @@ func (se *SearchEngine) lexicalSearch(ctx context.Context, query string, limit i
 			f.specialty_code,
 			f.section_title,
 			f.parent_titles,
-			f.version,
-			f.indexed_at,
+			f.version_number as version,
+			f.created_at as indexed_at,
 			bm25(fragments_fts) as score
 		FROM fragments_fts fts
 		JOIN fragments f ON fts.rowid = f.id
@@ -342,7 +375,6 @@ func (se *SearchEngine) lexicalSearch(ctx context.Context, query string, limit i
 			continue
 		}
 		
-		// Нормализуем BM25 score (обычно отрицательный)
 		r.LexicalScore = se.normalizeBM25Score(score)
 		r.LexicalRank = rank
 		rank++
@@ -350,7 +382,7 @@ func (se *SearchEngine) lexicalSearch(ctx context.Context, query string, limit i
 		results = append(results, r)
 	}
 	
-	return results, nil
+	return results, rows.Err()
 }
 
 // semanticSearch выполняет векторный поиск
@@ -372,16 +404,16 @@ func (se *SearchEngine) semanticSearch(ctx context.Context, query string, limit 
 			f.specialty_code,
 			f.section_title,
 			f.parent_titles,
-			f.version,
-			f.indexed_at,
-			fe.embedding
+			f.version_number as version,
+			f.created_at as indexed_at,
+			e.embedding_blob
 		FROM fragments f
-		JOIN fragment_embeddings fe ON f.id = fe.fragment_id
+		JOIN embeddings e ON f.id = e.fragment_id
 		LEFT JOIN pages p ON f.page_id = p.id
-		WHERE fe.embedding IS NOT NULL
+		WHERE e.model_name = ? AND e.embedding_blob IS NOT NULL
 	`
 	
-	rows, err := se.db.QueryContext(ctx, sqlQuery)
+	rows, err := se.db.QueryContext(ctx, sqlQuery, se.embeddingModel)
 	if err != nil {
 		return nil, err
 	}
@@ -461,9 +493,74 @@ func (se *SearchEngine) getQueryEmbedding(ctx context.Context, query string) ([]
 }
 
 // prepareFTS5Query подготавливает запрос для FTS5
+// extractProperNounsFromQuery извлекает имена собственные из запроса
+// (копия функции из search.go, но для использования в advanced_search)
+func extractProperNounsFromQuery(text string) []string {
+	words := strings.Fields(text)
+	properNouns := []string{}
+
+	// Служебные слова, которые НЕ являются именами собственными
+	serviceWords := map[string]bool{
+		"расскажи": true, "подскажи": true, "скажи": true, "привет": true, "здравствуйте": true,
+		"кто": true, "что": true, "где": true, "когда": true, "почему": true, "как": true,
+		"какой": true, "какая": true, "какие": true, "чей": true, "чья": true,
+	}
+
+	for idx, word := range words {
+		// Очищаем от пунктуации
+		cleaned := strings.Trim(word, ".,!?;:()[]{}\"'")
+		if len(cleaned) == 0 {
+			continue
+		}
+
+		// Проверяем, начинается ли с заглавной буквы
+		firstRune := []rune(cleaned)[0]
+		if unicode.IsUpper(firstRune) {
+			// Проверяем, не является ли это служебным словом
+			cleanedLower := strings.ToLower(cleaned)
+			if serviceWords[cleanedLower] {
+				continue
+			}
+
+			// Пропускаем первое слово если оно служебное
+			if idx == 0 && serviceWords[cleanedLower] {
+				continue
+			}
+
+			properNouns = append(properNouns, cleaned)
+		}
+	}
+
+	return properNouns
+}
+
+
 func (se *SearchEngine) prepareFTS5Query(query string) string {
+	// УЛУЧШЕНО: Сначала извлекаем имена собственные (до нормализации)
+	properNouns := extractProperNounsFromQuery(query)
+	
 	// Нормализуем и очищаем
 	normalized := normalize(query)
+	
+	// Guard: пустой запрос (не должно происходить, но на всякий случай)
+	if normalized == "" {
+		return normalized // вернём пустоту, guard выше обработает
+	}
+	
+	// Обрабатываем коды специальностей (XX.XX.XX)
+	// Заменяем точки на пробелы для FTS поиска
+	codePattern := regexp.MustCompile(`\d{2}\.\d{2}\.\d{2}`)
+	if codePattern.MatchString(normalized) {
+		// Найдем все коды
+		matches := codePattern.FindAllString(normalized, -1)
+		for _, match := range matches {
+			// Заменяем точки на пробелы: "40.02.04" -> "40 02 04"
+			withSpaces := strings.ReplaceAll(match, ".", " ")
+			// Оборачиваем в кавычки для phrase search
+			quoted := fmt.Sprintf(`"%s"`, withSpaces)
+			normalized = strings.ReplaceAll(normalized, match, quoted)
+		}
+	}
 	
 	// Убираем стоп-слова
 	stopWords := []string{"и", "или", "в", "на", "с", "по", "для", "о", "об", "к", "от"}
@@ -471,6 +568,12 @@ func (se *SearchEngine) prepareFTS5Query(query string) string {
 	filtered := []string{}
 	
 	for _, word := range words {
+		// Сохраняем кавычки и их содержимое как единый токен
+		if strings.HasPrefix(word, `"`) || strings.Contains(word, `"`) {
+			filtered = append(filtered, word)
+			continue
+		}
+		
 		if len(word) < 2 {
 			continue
 		}
@@ -482,16 +585,56 @@ func (se *SearchEngine) prepareFTS5Query(query string) string {
 			}
 		}
 		if !isStop {
-			filtered = append(filtered, word)
+			// Безопасно экранируем для FTS5
+			filtered = append(filtered, sanitizeFTSToken(word))
+		}
+	}
+	
+	// НОВОЕ: Добавляем prefix-поиск для имён собственных (фамилий)
+	// Это позволяет находить "Колесникова" при поиске "Колесниковой"
+	for _, proper := range properNouns {
+		properLower := strings.ToLower(proper)
+		// Добавляем стемминг/prefix поиск: "Колесников*"
+		if len(properLower) >= 4 {
+			// Берём основу (минус 2 последних символа для учета окончаний)
+			stem := properLower[:len(properLower)-2]
+			if len(stem) >= 3 {
+				filtered = append(filtered, fmt.Sprintf("%s*", sanitizeFTSToken(stem)))
+			}
 		}
 	}
 	
 	// Объединяем через OR для широкого поиска
 	if len(filtered) == 0 {
-		return normalized
+		safe := sanitizeFTSToken(normalized)
+		return safe
 	}
 	
 	return strings.Join(filtered, " OR ")
+}
+
+// sanitizeFTSToken безопасно обрабатывает токен для FTS5 MATCH
+// Предотвращает injection и обрабатывает спецсимволы
+func sanitizeFTSToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	
+	// Удаляем FTS операторы в начале
+	token = strings.TrimLeft(token, "+-")
+	
+	// Экранируем кавычки внутри токена
+	token = strings.ReplaceAll(token, `"`, `""`)
+	
+	// Проверяем нужно ли обернуть в кавычки
+	// Коды специальностей (54.02.01), составные слова, дефисы
+	needsQuotes := strings.ContainsAny(token, ".-/ ")
+	
+	if needsQuotes {
+		return `"` + token + `"`
+	}
+	
+	return token
 }
 
 
@@ -541,27 +684,464 @@ func (se *SearchEngine) combineWithRRF(lexical, semantic []HybridSearchResult) [
 	return combined
 }
 
+// ScoreBonus представляет разбивку бонусов для отладки
+type ScoreBonus struct {
+	Base             float64
+	SpecialtyMatch   float64 // текущая специальность из запроса
+	SpecialtyContext float64 // специальность из истории диалога
+	SectionMatch     float64
+	TopicMatch       float64
+	CategoryMatch    float64 // НОВОЕ: бонус за категориальное соответствие
+	RecencyBonus     float64
+	URLMultiplier    float64 // URL-based scoring multiplier
+	Total            float64
+}
+
+// calculateFinalScore вычисляет итоговую оценку с бонусами (централизовано)
+func (se *SearchEngine) calculateFinalScore(result *HybridSearchResult, query string, dialogContext *DialogContext) ScoreBonus {
+	bonus := ScoreBonus{
+		Base: result.RRFScore, // Начинаем с RRF как базы
+		URLMultiplier: 1.0,    // По умолчанию нейтральный множитель
+	}
+	
+	queryNorm := normalize(query)
+	textNorm := normalize(result.Text)
+	
+	// ПРИОРИТЕТ 1: Текущая специальность из запроса (явное упоминание)
+	if result.SpecialtyCode != nil {
+		specialtyCode := *result.SpecialtyCode
+		
+		// Проверяем явное упоминание кода в запросе (до нормализации!)
+		if strings.Contains(query, specialtyCode) || strings.Contains(queryNorm, strings.ReplaceAll(specialtyCode, ".", " ")) {
+			bonus.SpecialtyMatch = 0.4 // Сильный бонус за точное совпадение
+		} else {
+			// Проверяем упоминание названия специальности
+			specialtyNames := map[string]string{
+				"54.02.01": "дизайн",
+				"44.02.02": "преподавание",
+				"40.02.04": "юриспруденц",
+				"40.02.01": "социальн", // Право и организация социального обеспечения
+			}
+			if name, ok := specialtyNames[specialtyCode]; ok {
+				if strings.Contains(queryNorm, name) {
+					bonus.SpecialtyMatch = 0.3 // Средний бонус за название
+				}
+			}
+			
+			// Дополнительные синонимы для специальностей
+			if specialtyCode == "44.02.02" && (strings.Contains(queryNorm, "учитель") || strings.Contains(queryNorm, "педагог")) {
+				bonus.SpecialtyMatch = 0.3
+			}
+			if specialtyCode == "40.02.04" && (strings.Contains(queryNorm, "юрист") || strings.Contains(queryNorm, "право")) {
+				bonus.SpecialtyMatch = 0.3
+			}
+		}
+	}
+	
+	// ПРИОРИТЕТ 2: Специальность из контекста диалога (только если нет текущей)
+	if bonus.SpecialtyMatch == 0.0 && dialogContext != nil && result.SpecialtyCode != nil {
+		if lastSpecCode, ok := dialogContext.LastEntities["specialty_code"]; ok {
+			if *result.SpecialtyCode == lastSpecCode {
+				bonus.SpecialtyContext = 0.2 // Меньший бонус за контекстную специальность
+			}
+		}
+	}
+	
+	// Совпадение заголовка секции
+	if result.SectionTitle != nil {
+		sectionNorm := normalize(*result.SectionTitle)
+		queryWords := strings.Fields(queryNorm)
+		sectionWords := strings.Fields(sectionNorm)
+		
+		matchCount := 0
+		for _, qw := range queryWords {
+			if len(qw) < 3 {
+				continue
+			}
+			for _, sw := range sectionWords {
+				if strings.Contains(sw, qw) || strings.Contains(qw, sw) {
+					matchCount++
+					break
+				}
+			}
+		}
+		
+		if matchCount > 0 && len(queryWords) > 0 {
+			bonus.SectionMatch = 0.15 * float64(matchCount) / float64(len(queryWords))
+		}
+	}
+	
+	// НОВОЕ: Категориальный бонус (приоритет для целевой категории)
+	// Если фрагмент из категории, соответствующей интенту, даем бонус
+	if result.URL != "" {
+		// Детектируем категорию фрагмента по URL
+		fragmentCategory := DetectCategory(result.URL)
+		
+		// Определяем ожидаемую категорию на основе запроса
+		expectedCategory := mapQueryToCategory(query)
+		
+		if expectedCategory != "" && fragmentCategory != nil && fragmentCategory.CategoryID == expectedCategory {
+			bonus.CategoryMatch = 0.20 // Приоритет целевой категории
+			log.Printf("  🎯 Category match bonus: %s", fragmentCategory.CategoryID)
+		}
+	}
+	
+	// Совпадение с текущей темой диалога
+	if dialogContext != nil && dialogContext.CurrentTopic != "" {
+		topicKeywords := getTopicKeywords(dialogContext.CurrentTopic)
+		for _, kw := range topicKeywords {
+			if strings.Contains(textNorm, kw) {
+				bonus.TopicMatch = 0.15
+				break
+			}
+		}
+	}
+	
+	// URL-based scoring multiplier (анти-Homepage Bias)
+	bonus.URLMultiplier = calculateURLMultiplier(result.URL, query)
+	
+	// Итоговая оценка (сначала суммируем все бонусы, затем применяем URL multiplier)
+	baseScore := bonus.Base + bonus.SpecialtyMatch + bonus.SpecialtyContext + 
+	              bonus.SectionMatch + bonus.TopicMatch + bonus.CategoryMatch + bonus.RecencyBonus
+	
+	bonus.Total = baseScore * bonus.URLMultiplier
+	
+	return bonus
+}
+
+// calculateURLMultiplier вычисляет множитель на основе типа URL страницы
+// Цель: понизить приоритет главной страницы и повысить специализированные разделы
+func calculateURLMultiplier(url string, query string) float64 {
+	if url == "" {
+		return 1.0
+	}
+	
+	urlLower := strings.ToLower(url)
+	queryLower := strings.ToLower(query)
+	
+	// ШТРАФ: Главная страница (корень домена с мусорными параметрами)
+	// Примеры: https://college-nomos.ru/, https://college-nomos.ru/?month=10&year=2025
+	if strings.HasSuffix(urlLower, "college-nomos.ru/") || 
+	   strings.Contains(urlLower, "college-nomos.ru/?month=") ||
+	   strings.Contains(urlLower, "college-nomos.ru/?year=") {
+		return 0.15 // Очень сильный штраф за главную страницу
+	}
+	
+	// БОНУС: Специализированные разделы (в порядке приоритета)
+	
+	// 1. Контакты и реквизиты (высокий приоритет для таких запросов)
+	if strings.Contains(urlLower, "/contacts") || strings.Contains(urlLower, "/requisites") {
+		if strings.Contains(queryLower, "контакт") || strings.Contains(queryLower, "адрес") ||
+		   strings.Contains(queryLower, "телефон") || strings.Contains(queryLower, "email") ||
+		   strings.Contains(queryLower, "реквизит") {
+			return 2.0 // Очень сильный бонус при релевантности
+		}
+		return 1.5 // Средний бонус для контактов
+	}
+	
+	// 2. Раздел поступления (abitur) - критически важный
+	if strings.Contains(urlLower, "/abitur/") {
+		if strings.Contains(queryLower, "поступ") || strings.Contains(queryLower, "абитур") ||
+		   strings.Contains(queryLower, "документ") || strings.Contains(queryLower, "прием") ||
+		   strings.Contains(queryLower, "зачисл") || strings.Contains(queryLower, "стоимость") {
+			return 2.0
+		}
+		return 1.6
+	}
+	
+	// 3. Преподаватели - ПРИОРИТЕТ для страницы /teachers/
+	// Это единая чистая страница со списком всех преподавателей и их предметов
+	if strings.Contains(urlLower, "/teachers/") || strings.Contains(urlLower, "/teachers") {
+		// Запросы о преподавателях - максимальный приоритет
+		if strings.Contains(queryLower, "кто так") || 
+		   strings.Contains(queryLower, "преподава") || 
+		   strings.Contains(queryLower, "преподаёт") ||
+		   strings.Contains(queryLower, "учитель") ||
+		   strings.Contains(queryLower, "педагог") ||
+		   strings.Contains(queryLower, "директор") ||
+		   strings.Contains(queryLower, "кто ведёт") ||
+		   strings.Contains(queryLower, "кто ведет") ||
+		   containsPersonName(query) {
+			return 3.5 // МАКСИМАЛЬНЫЙ приоритет для /teachers/
+		}
+		return 2.5 // Высокий приоритет даже для общих запросов
+	}
+	
+	// 4. Пересдачи и справки (/retake/) - критически важная страница для студентов
+	if strings.Contains(urlLower, "/retake/") {
+		if strings.Contains(queryLower, "пересдач") || strings.Contains(queryLower, "справк") ||
+		   strings.Contains(queryLower, "направлен") || strings.Contains(queryLower, "пересдат") ||
+		   strings.Contains(queryLower, "академическ") {
+			return 2.5 // Очень высокий приоритет для запросов о пересдачах/справках
+		}
+		return 1.8
+	}
+	
+	// 5. Сведения об образовательной организации (sveden) - понижаем приоритет
+	// Теперь /teachers/ - основной источник для преподавателей
+	if strings.Contains(urlLower, "/sveden/employees/prepodavateli/") {
+		// Персональные страницы - средний приоритет (уступают /teachers/)
+		if containsPersonName(query) {
+			return 1.8
+		}
+		return 1.3
+	}
+	
+	if strings.Contains(urlLower, "/sveden/teaching") {
+		// Табличный список преподавателей - низкий приоритет (уступают /teachers/)
+		return 1.2
+	}
+	
+	if strings.Contains(urlLower, "/sveden/") {
+		if strings.Contains(queryLower, "документ") || strings.Contains(queryLower, "лиценз") ||
+		   strings.Contains(queryLower, "аккредит") || strings.Contains(queryLower, "устав") ||
+		   strings.Contains(queryLower, "программ") {
+			return 1.4
+		}
+		return 1.3
+	}
+	
+	// 6. Студентам (students) - учебная информация
+	if strings.Contains(urlLower, "/students/") {
+		if strings.Contains(queryLower, "расписан") || strings.Contains(queryLower, "учеб") ||
+		   strings.Contains(queryLower, "студент") || strings.Contains(queryLower, "сессия") {
+			return 1.3
+		}
+		return 1.2
+	}
+	
+	// 7. Жизнь колледжа (life, FAQ)
+	if strings.Contains(urlLower, "/life/") {
+		if strings.Contains(queryLower, "общежит") || strings.Contains(queryLower, "досуг") ||
+		   strings.Contains(queryLower, "мероприят") || strings.Contains(queryLower, "кружок") {
+			return 1.8
+		}
+		return 1.4
+	}
+	
+	// 8. Новости и пресс-центр (более низкий приоритет для общих запросов)
+	if strings.Contains(urlLower, "/press-center/") || strings.Contains(urlLower, "/news/") {
+		if strings.Contains(queryLower, "новост") || strings.Contains(queryLower, "событи") {
+			return 1.1
+		}
+		return 0.9 // Небольшой штраф для новостей при неявных запросах
+	}
+	
+	// По умолчанию: нейтральный множитель для всех остальных страниц
+	return 1.0
+}
+
+// containsPersonName проверяет наличие ФИО в запросе (простая эвристика)
+func containsPersonName(query string) bool {
+	// Ищем паттерн: 2-3 слова с заглавной буквы подряд (возможно ФИО)
+	words := strings.Fields(query)
+	capitalized := 0
+	
+	for _, word := range words {
+		// Убираем знаки препинания
+		word = strings.Trim(word, ".,!?;:")
+		if len(word) > 2 && len(word) < 20 {
+			// Проверяем что слово начинается с заглавной буквы (кириллица или латиница)
+			firstRune := []rune(word)[0]
+			if (firstRune >= 'А' && firstRune <= 'Я') || (firstRune >= 'A' && firstRune <= 'Z') {
+				capitalized++
+				if capitalized >= 2 { // Как минимум Имя Фамилия
+					return true
+				}
+			} else {
+				capitalized = 0 // Сброс счетчика если слово не с заглавной
+			}
+		}
+	}
+	
+	return false
+}
+
+// mapQueryToCategory сопоставляет запрос с ожидаемой категорией
+func mapQueryToCategory(query string) string {
+	queryLower := strings.ToLower(query)
+	
+	// Приоритет 1: Специальности (самый высокий приоритет)
+	if strings.Contains(queryLower, "дизайн") {
+		return "abitur_specialty_design"
+	}
+	if strings.Contains(queryLower, "юриспруденц") || strings.Contains(queryLower, "юрист") || strings.Contains(queryLower, "право") {
+		return "abitur_specialty_law"
+	}
+	if strings.Contains(queryLower, "преподаван") || strings.Contains(queryLower, "учитель") || strings.Contains(queryLower, "педагог") {
+		return "abitur_specialty_teacher"
+	}
+	
+	// Приоритет 2: Финансы и оплата
+	if strings.Contains(queryLower, "стоимость") || strings.Contains(queryLower, "оплат") || 
+	   strings.Contains(queryLower, "цена") || strings.Contains(queryLower, "сколько стоит") ||
+	   strings.Contains(queryLower, "платн") || strings.Contains(queryLower, "деньги") {
+		return "finance_paid_edu"
+	}
+	
+	// Приоритет 3: Поступление и абитуриенты
+	if strings.Contains(queryLower, "поступ") || strings.Contains(queryLower, "абитур") ||
+	   strings.Contains(queryLower, "прием") || strings.Contains(queryLower, "зачисл") {
+		// Если упомянута специальность, вернем специальность
+		if strings.Contains(queryLower, "дизайн") {
+			return "abitur_specialty_design"
+		}
+		if strings.Contains(queryLower, "юрист") || strings.Contains(queryLower, "право") {
+			return "abitur_specialty_law"
+		}
+		if strings.Contains(queryLower, "учитель") || strings.Contains(queryLower, "педагог") {
+			return "abitur_specialty_teacher"
+		}
+		return "abitur_postupayushchim"
+	}
+	
+	// Приоритет 4: Документы для поступления
+	if strings.Contains(queryLower, "документ") && (strings.Contains(queryLower, "поступ") || 
+	   strings.Contains(queryLower, "нужн") || strings.Contains(queryLower, "подать")) {
+		return "abitur_postupayushchim"
+	}
+	
+	// Приоритет 5: Специальности (общий вопрос)
+	if strings.Contains(queryLower, "специальность") || strings.Contains(queryLower, "направлен") ||
+	   strings.Contains(queryLower, "профес") || strings.Contains(queryLower, "кем работать") {
+		return "abitur_specialties"
+	}
+	
+	// Приоритет 6: Практика
+	if strings.Contains(queryLower, "практик") || strings.Contains(queryLower, "стажировк") {
+		return "students_practice"
+	}
+	
+	// Приоритет 7: Расписание
+	if strings.Contains(queryLower, "расписан") || strings.Contains(queryLower, "когда занятия") ||
+	   strings.Contains(queryLower, "график") || strings.Contains(queryLower, "пар") {
+		return "students_schedule"
+	}
+	
+	// Приоритет 8: Преподаватели и руководство
+	if strings.Contains(queryLower, "преподава") || strings.Contains(queryLower, "учитель") ||
+	   strings.Contains(queryLower, "кто ведет") || strings.Contains(queryLower, "кто преподает") ||
+	   strings.Contains(queryLower, "педагог") {
+		return "staff_teachers"
+	}
+	if strings.Contains(queryLower, "директор") || strings.Contains(queryLower, "руководител") ||
+	   strings.Contains(queryLower, "администрац") {
+		return "staff_managers"
+	}
+	
+	// Приоритет 9: Контакты
+	if strings.Contains(queryLower, "контакт") || strings.Contains(queryLower, "телефон") ||
+	   strings.Contains(queryLower, "адрес") || strings.Contains(queryLower, "email") ||
+	   strings.Contains(queryLower, "как связаться") || strings.Contains(queryLower, "где находится") {
+		return "general_contacts"
+	}
+	
+	// Приоритет 10: Документы колледжа
+	if strings.Contains(queryLower, "устав") || strings.Contains(queryLower, "лицензи") ||
+	   strings.Contains(queryLower, "аккредитац") {
+		return "sveden_document"
+	}
+	
+	// Приоритет 11: Образовательные программы
+	if strings.Contains(queryLower, "учебн") && (strings.Contains(queryLower, "план") || 
+	   strings.Contains(queryLower, "программ") || strings.Contains(queryLower, "стандарт")) {
+		return "sveden_education"
+	}
+	
+	// Приоритет 12: Вакантные места
+	if strings.Contains(queryLower, "вакантн") || strings.Contains(queryLower, "сколько мест") ||
+	   strings.Contains(queryLower, "бюджетн") {
+		return "sveden_vacant"
+	}
+	
+	// Приоритет 13: Материально-техническое обеспечение
+	if strings.Contains(queryLower, "кабинет") || strings.Contains(queryLower, "спортзал") ||
+	   strings.Contains(queryLower, "библиотек") || strings.Contains(queryLower, "оборудован") {
+		return "sveden_objects"
+	}
+	
+	// Приоритет 14: Основные сведения
+	if strings.Contains(queryLower, "учредител") || strings.Contains(queryLower, "юридическ") {
+		return "sveden_common"
+	}
+	
+	// Приоритет 15: О колледже
+	if strings.Contains(queryLower, "истори") || strings.Contains(queryLower, "когда основ") ||
+	   strings.Contains(queryLower, "о колледж") {
+		return "general_about"
+	}
+	
+	// Приоритет 16: Новости
+	if strings.Contains(queryLower, "новост") || strings.Contains(queryLower, "событи") ||
+	   strings.Contains(queryLower, "мероприят") {
+		return "general_news"
+	}
+	
+	// Приоритет 17: Выпускники
+	if strings.Contains(queryLower, "выпускн") || strings.Contains(queryLower, "диплом") ||
+	   strings.Contains(queryLower, "вкр") || strings.Contains(queryLower, "защит") {
+		return "students_graduates"
+	}
+	
+	return "" // Категория не определена
+}
+
 // deepRanking выполняет глубокое ранжирование с учетом контекста
 func (se *SearchEngine) deepRanking(pool *CandidatePool) []HybridSearchResult {
 	for i := range pool.Candidates {
-		// Базовая оценка из RRF
-		baseScore := pool.Candidates[i].RRFScore
+		// Вычисляем итоговую оценку с бонусами
+		scoreBonus := se.calculateFinalScore(&pool.Candidates[i], pool.Query, pool.DialogContext)
+		pool.Candidates[i].CombinedScore = scoreBonus.Total
+		pool.Candidates[i].ContextRelevance = scoreBonus.TopicMatch
 		
-		// Контекстная оценка (анафора, история диалога)
-		contextBoost := se.calculateContextRelevance(&pool.Candidates[i], pool.Query, pool.DialogContext)
-		
-		// Оценка метаданных (специальность, секция, дата)
-		metadataBoost := se.calculateMetadataRelevance(&pool.Candidates[i], pool.Query)
-		
-		// Итоговая комбинированная оценка
-		pool.Candidates[i].ContextRelevance = contextBoost
-		pool.Candidates[i].CombinedScore = baseScore * (1.0 + contextBoost + metadataBoost)
+		// Логируем разбивку для отладки
+		if scoreBonus.SpecialtyMatch > 0 || scoreBonus.SpecialtyContext > 0 || scoreBonus.SectionMatch > 0 || scoreBonus.URLMultiplier != 1.0 {
+			log.Printf("  🎯 Score [frag=%d]: base=%.3f spec=%.3f+%.3f sec=%.3f topic=%.3f ×url=%.2fx → %.3f",
+				pool.Candidates[i].FragmentID, scoreBonus.Base, 
+				scoreBonus.SpecialtyMatch, scoreBonus.SpecialtyContext,
+				scoreBonus.SectionMatch, scoreBonus.TopicMatch, 
+				scoreBonus.URLMultiplier, scoreBonus.Total)
+		}
 	}
 	
-	// Сортируем по итоговой оценке
-	sort.Slice(pool.Candidates, func(i, j int) bool {
-		return pool.Candidates[i].CombinedScore > pool.Candidates[j].CombinedScore
+	// Стабильная сортировка по итоговой оценке
+	sort.SliceStable(pool.Candidates, func(i, j int) bool {
+		// Сначала по оценке
+		if pool.Candidates[i].CombinedScore != pool.Candidates[j].CombinedScore {
+			return pool.Candidates[i].CombinedScore > pool.Candidates[j].CombinedScore
+		}
+		// При равной оценке - по FragmentID (детерминизм)
+		return pool.Candidates[i].FragmentID < pool.Candidates[j].FragmentID
 	})
+	
+	// ANTI-HOMEPAGE BIAS: Если есть специализированные страницы, фильтруем главную
+	hasSpecializedPages := false
+	for _, cand := range pool.Candidates {
+		urlLower := strings.ToLower(cand.URL)
+		if strings.Contains(urlLower, "/contacts") || strings.Contains(urlLower, "/abitur/") ||
+		   strings.Contains(urlLower, "/sveden/") || strings.Contains(urlLower, "/life/") ||
+		   strings.Contains(urlLower, "/students/") || strings.Contains(urlLower, "/requisites") ||
+		   strings.Contains(urlLower, "/teachers/") || strings.Contains(urlLower, "/retake/") {
+			hasSpecializedPages = true
+			break
+		}
+	}
+	
+	if hasSpecializedPages {
+		// Удаляем главную страницу из результатов
+		filtered := make([]HybridSearchResult, 0, len(pool.Candidates))
+		for _, cand := range pool.Candidates {
+			urlLower := strings.ToLower(cand.URL)
+			isHomepage := strings.HasSuffix(urlLower, "college-nomos.ru/") ||
+			             strings.Contains(urlLower, "college-nomos.ru/?month=") ||
+			             strings.Contains(urlLower, "college-nomos.ru/?year=")
+			
+			if !isHomepage {
+				filtered = append(filtered, cand)
+			}
+		}
+		return filtered
+	}
 	
 	return pool.Candidates
 }
@@ -766,15 +1346,18 @@ func SearchMaterialsWithAdvancedEngine(ctx context.Context, db *sql.DB, cfg Conf
 	
 	for _, query := range queries {
 		// Выполняем продвинутый поиск
+		log.Printf("🔍 SEARCH ENGINE: Searching for query='%s'", query.Text)
 		hybridResults, err := searchEngine.Search(ctx, query.Text, dialogContext, 10)
 		if err != nil {
 			log.Printf("Warning: advanced search failed: %v", err)
 			// Fallback на старый метод
 			return SearchMaterialsWithContext(ctx, cfg, queries, dialogContext)
 		}
+		log.Printf("🔍 SEARCH ENGINE: Found %d results for query='%s'", len(hybridResults), query.Text)
 
 		// Конвертируем HybridSearchResult в SearchResult
-		for _, hr := range hybridResults {
+		for i, hr := range hybridResults {
+			log.Printf("  📄 Result #%d: score=%.3f url=%s text_len=%d", i+1, hr.CombinedScore, hr.URL, len(hr.Text))
 			sr := SearchResult{
 				Fragment:   hr.Text,
 				FragmentID: hr.FragmentID,
